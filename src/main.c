@@ -229,7 +229,7 @@ static int get_term_cols(void) {
 static void fprint_trunc(FILE *out, const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
-    if (len <= width) fprintf(out, "%*s", width, s);
+    if (len <= width) fprintf(out, "%-*s", width, s);
     else if (width <= 3) fprintf(out, "%.*s", width, s);
     else fprintf(out, "%.*s...", width - 3, s);
 }
@@ -271,21 +271,18 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
     char path[PATH_MAX], buf[8192];
     ssize_t n = 0;
     
-    // 1. Try /proc/[pid]/cmdline
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n);
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
-    // 2. Try /proc/[pid]/comm
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n); 
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
-    // 3. Try parsing name from /proc/[pid]/stat
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         char *start = strchr(buf, '(');
@@ -833,7 +830,7 @@ int main(int argc, char **argv) {
     uint64_t curr_sys_r=0, curr_sys_w=0;
     read_system_disk_iops(&prev_sys_r, &prev_sys_w);
 
-    printf("Initializing (wait %.0fs)...\\n", interval);
+    printf("Initializing (wait %.0fs)...\n", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
@@ -1040,7 +1037,6 @@ int main(int argc, char **argv) {
 
                     for (size_t i=0; i<curr_disk.len; i++) {
                         const disk_sample_t *d = &curr_disk.data[i];
-                        // Filter
                         if (strlen(filter_str) > 0 && !strcasestr(d->name, filter_str)) continue;
 
                         printf("%*s %*.*f %*.*f %*.*f %*.*f\n",
@@ -1088,8 +1084,8 @@ int main(int argc, char **argv) {
                         memw, "Res(MiB)",
                         memw, "Shr(MiB)",
                         memw, "Virt(MiB)",
-                        logw, "[3] R_Log",
-                        logw, "[4] W_Log",
+                        iopsw, "[3] R_Log",
+                        iopsw, "[4] W_Log",
                         waitw, "[5] Wait",
                         mibw, "[6] R_MiB",
                         mibw, "[7] W_MiB",
@@ -1154,8 +1150,8 @@ int main(int argc, char **argv) {
                             memw, res_mib,
                             memw, shr_mib,
                             memw, virt_mib,
-                            logw, 2, c->r_iops,
-                            logw, 2, c->w_iops,
+                            iopsw, 2, c->r_iops,
+                            iopsw, 2, c->w_iops,
                             waitw, 2, c->io_wait_ms,
                             mibw, 0, c->r_mib,
                             mibw, 0, c->w_mib,
@@ -1165,7 +1161,7 @@ int main(int argc, char **argv) {
                         putchar('\n');
 
                         if (show_tree) {
-                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, logw, waitw, mibw, cmdw);
+                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, iopsw, waitw, mibw, cmdw);
                         }
                     }
 
@@ -1178,20 +1174,90 @@ int main(int argc, char **argv) {
                             memw, t_res,
                             memw, t_shr,
                             memw, t_virt,
-                            logw, 2, t_ri,
-                            logw, 2, t_wi,
+                            iopsw, 2, t_ri,
+                            iopsw, 2, t_wi,
                             waitw, 2, t_wt,
                             mibw, 0, t_rm,
                             mibw, 0, t_wm,
                             cpuw, 2, t_cpu);
+                }
+                fflush(stdout);
+                dirty = 0;
+            }
+
+            double elapsed = now_monotonic() - start_wait;
+            double remain = interval - elapsed;
+            if (remain <= 0) break;
+
+            int c = wait_for_input(remain);
+            if (c > 0) {
+                if (in_filter_mode) {
+                    if (c == 27) { // ESC
+                        in_filter_mode = 0;
+                        filter_str[0] = '\0';
+                        dirty = 1;
+                    } else if (c == 127 || c == 8) { // Backspace
+                        size_t len = strlen(filter_str);
+                        if (len > 0) filter_str[len-1] = '\0';
+                        dirty = 1;
+                    } else if (c == '\n' || c == '\r') {
+                        in_filter_mode = 0;
+                        dirty = 1;
+                    } else if (isprint(c)) {
+                        size_t len = strlen(filter_str);
+                        if (len < sizeof(filter_str)-1) {
+                            filter_str[len] = (char)c;
+                            filter_str[len+1] = '\0';
+                        }
+                        dirty = 1;
+                    }
+                } else if (in_limit_mode) {
+                    if (c == 27) { // ESC
+                        in_limit_mode = 0;
+                        limit_str[0] = '\0';
+                        dirty = 1;
+                    } else if (c == 127 || c == 8) {
+                        size_t len = strlen(limit_str);
+                        if (len > 0) limit_str[len-1] = '\0';
+                        dirty = 1;
+                    } else if (c == '\n' || c == '\r') {
+                        if (strlen(limit_str) > 0) {
+                            int val = atoi(limit_str);
+                            if (val > 0) display_limit = val;
+                        }
+                        in_limit_mode = 0;
+                        limit_str[0] = '\0';
+                        dirty = 1;
+                    } else if (isdigit(c)) {
+                        size_t len = strlen(limit_str);
+                        if (len < sizeof(limit_str)-1) {
+                            limit_str[len] = (char)c;
+                            limit_str[len+1] = '\0';
+                        }
+                        dirty = 1;
+                    }
+                } else {
+                    if (c == '/') { in_filter_mode = 1; dirty = 1; }
+                    if (c == 'l' || c == 'L') { in_limit_mode = 1; limit_str[0]='\0'; dirty = 1; }
+                    if (c == 'q' || c == 'Q') goto cleanup;
+                    if (c == 'f' || c == 'F') { frozen = !frozen; dirty = 1; }
+                    if (c == 't' || c == 'T') { show_tree = !show_tree; mode = MODE_PROCESS; dirty = 1; }
+                    if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
+                    if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
+                    if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
                     
-                    if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
-                    if (c == '2' || c == 0x02) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
-                    if (c == '3' || c == 0x03) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
-                    if (c == '4' || c == 0x04) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
-                    if (c == '5' || c == 0x05) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
-                    if (c == '6' || c == 0x06) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
-                    if (c == '7' || c == 0x07) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
+                    if (mode == MODE_PROCESS) {
+                        if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == 0x02) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
+                        if (c == '3' || c == 0x03) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
+                        if (c == '4' || c == 0x04) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
+                        if (c == '5' || c == 0x05) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
+                        if (c == '6' || c == 0x06) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '7' || c == 0x07) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
+                    } else { // MODE_NETWORK
+                        if (c == '1' || c == 0x01) { sort_col_net = SORT_NET_RX; dirty = 1; }
+                        if (c == '2' || c == 0x02) { sort_col_net = SORT_NET_TX; dirty = 1; }
+                    }
                 }
             }
         }
