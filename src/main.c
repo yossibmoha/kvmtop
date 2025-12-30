@@ -371,6 +371,7 @@ static void usage(const char *argv0) {
 }
 
 int main(int argc, char **argv) {
+    printf("kvmtop (static build) starting...\n");
     double interval = 1.0;
     long samples = -1;
     int include_threads = 0;

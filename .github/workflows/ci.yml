@@ -24,13 +24,13 @@ jobs:
     - name: Build
       run: |
         make
-        mv build/kvmtop build/kvmtop-linux-amd64
+        mv build/kvmtop build/kvmtop-static-linux-amd64
 
     - name: Upload Build Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: kvmtop-linux-amd64
-        path: build/kvmtop-linux-amd64
+        name: kvmtop-static-linux-amd64
+        path: build/kvmtop-static-linux-amd64
 
     - name: Release
       uses: softprops/action-gh-release@v1
@@ -38,7 +38,7 @@ jobs:
       with:
         tag_name: latest
         name: Latest Build
-        files: build/kvmtop-linux-amd64
+        files: build/kvmtop-static-linux-amd64
         draft: false
         prerelease: false
         overwrite: true
