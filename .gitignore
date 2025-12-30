@@ -1,0 +1,23 @@
+# Object files
+*.o
+*.obj
+
+# Libraries
+*.a
+*.lib
+*.so
+*.dll
+*.dylib
+
+# Executables
+kvmtop
+*.exe
+*.out
+*.app
+
+# Build directory
+build/
+
+# OS generated files
+.DS_Store
+Thumbs.db
