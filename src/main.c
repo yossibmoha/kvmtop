@@ -228,7 +228,10 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
             char io_path[PATH_MAX], stat_path[PATH_MAX];
             snprintf(io_path, sizeof(io_path), "/proc/%d/io", pid);
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
+            
+            // Try reading IO, ignore failure (s.syscr etc are already 0 from memset)
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
+            
             read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
             vec_push(out, &s);
         } else {
@@ -247,7 +250,10 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
                 char io_path[PATH_MAX], stat_path[PATH_MAX];
                 snprintf(io_path, sizeof(io_path), "/proc/%d/task/%d/io", pid, tid);
                 snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
+                
+                // Try reading IO, ignore failure
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
+                
                 read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
                 vec_push(out, &s);
             }
@@ -328,9 +334,14 @@ static int cmp_wmib_desc(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
+    if (geteuid() != 0) {
+        fprintf(stderr, "Warning: Not running as root. IO stats will be unavailable for other users' processes.\n");
+        sleep(2);
+    }
+
     double interval = 5.0; // Default to 5 seconds
     int include_threads = 0;
-    int display_limit = 50; // Default to 50 lines
+    int display_limit = 50; 
     
     pid_t *filter = NULL;
     size_t filter_n = 0, filter_cap = 0;
@@ -440,7 +451,8 @@ int main(int argc, char **argv) {
                 fprint_trunc(stdout, "COMMAND", cmdw);
                 printf("\n");
                 
-                for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
+                for(int i=0; i<cols; i++) putchar('-');
+                putchar('\n');
 
                 int limit = display_limit; 
                 if ((size_t)limit > curr.len) limit = curr.len;
