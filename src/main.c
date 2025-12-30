@@ -21,7 +21,7 @@
 #define CMD_MAX 512
 #endif
 
-// --- Terminal Handling for Interactive Input ---
+// --- Terminal Handling ---
 static struct termios orig_termios;
 static int raw_mode_enabled = 0;
 
@@ -29,7 +29,7 @@ static void disable_raw_mode() {
     if (raw_mode_enabled) {
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode_enabled = 0;
-        printf("\033[?25h"); // Show cursor
+        printf("\033[?25h"); 
     }
 }
 
@@ -41,7 +41,7 @@ static void enable_raw_mode() {
     raw.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
     raw_mode_enabled = 1;
-    printf("\033[?25l"); // Hide cursor
+    printf("\033[?25l"); 
 }
 
 static int wait_for_input(double seconds) {
@@ -63,7 +63,6 @@ static int wait_for_input(double seconds) {
 }
 
 // --- Data Structures ---
-
 typedef struct {
     pid_t pid;
     pid_t tid;
@@ -75,7 +74,6 @@ typedef struct {
     uint64_t write_bytes;
     uint64_t cpu_jiffies;
 
-    // Calculated Rates
     double cpu_pct;
     double r_iops;
     double w_iops;
@@ -91,27 +89,13 @@ typedef struct {
     size_t cap;
 } vec_t;
 
-static void vec_init(vec_t *v) {
-    v->data = NULL;
-    v->len = 0;
-    v->cap = 0;
-}
-
-static void vec_free(vec_t *v) {
-    free(v->data);
-    v->data = NULL;
-    v->len = 0;
-    v->cap = 0;
-}
-
+static void vec_init(vec_t *v) { v->data=NULL; v->len=0; v->cap=0; }
+static void vec_free(vec_t *v) { free(v->data); v->data=NULL; v->len=0; v->cap=0; }
 static void vec_push(vec_t *v, const sample_t *item) {
     if (v->len == v->cap) {
         size_t new_cap = v->cap ? v->cap * 2 : 4096;
         sample_t *p = (sample_t *)realloc(v->data, new_cap * sizeof(*p));
-        if (!p) {
-            fprintf(stderr, "Out of memory\n");
-            exit(2);
-        }
+        if (!p) { fprintf(stderr, "OOM\n"); exit(2); }
         v->data = p;
         v->cap = new_cap;
     }
@@ -120,9 +104,7 @@ static void vec_push(vec_t *v, const sample_t *item) {
 
 static int is_numeric_str(const char *s) {
     if (!s || !*s) return 0;
-    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) {
-        if (!isdigit(*p)) return 0;
-    }
+    for (const unsigned char *p = (const unsigned char *)s; *p; ++p) if (!isdigit(*p)) return 0;
     return 1;
 }
 
@@ -168,8 +150,7 @@ static void sanitize_cmd(char out[CMD_MAX], const char *in, size_t in_len) {
 }
 
 static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
-    char path[PATH_MAX];
-    char buf[8192];
+    char path[PATH_MAX], buf[8192];
     ssize_t n = 0;
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
@@ -185,17 +166,14 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
     return -1;
 }
 
-static int read_io_file(const char *path,
-                        uint64_t *syscr, uint64_t *syscw,
-                        uint64_t *read_bytes, uint64_t *write_bytes) {
+static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint64_t *read_bytes, uint64_t *write_bytes) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    uint64_t v_syscr = 0, v_syscw = 0, v_rbytes = 0, v_wbytes = 0;
+    uint64_t v_syscr=0, v_syscw=0, v_rbytes=0, v_wbytes=0;
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        char key[64];
-        unsigned long long val = 0;
-        if (sscanf(line, "%63[^:]: %llu", key, &val) == 2) {
+        char key[64]; unsigned long long val = 0;
+        if (sscanf(line, "%63[^:]:\s%llu", key, &val) == 2) {
             if (strcmp(key, "syscr") == 0) v_syscr = (uint64_t)val;
             else if (strcmp(key, "syscw") == 0) v_syscw = (uint64_t)val;
             else if (strcmp(key, "read_bytes") == 0) v_rbytes = (uint64_t)val;
@@ -203,33 +181,22 @@ static int read_io_file(const char *path,
         }
     }
     fclose(f);
-    *syscr = v_syscr;
-    *syscw = v_syscw;
-    *read_bytes = v_rbytes;
-    *write_bytes = v_wbytes;
+    *syscr = v_syscr; *syscw = v_syscw; *read_bytes = v_rbytes; *write_bytes = v_wbytes;
     return 0;
 }
 
 static int read_cpu_jiffies_from_stat(const char *path, uint64_t *cpu_jiffies_out) {
-    char buf[4096];
-    ssize_t n = 0;
+    char buf[4096]; ssize_t n = 0;
     if (read_small_file(path, buf, sizeof(buf), &n) != 0 || n <= 0) return -1;
     char *rparen = strrchr(buf, ')');
     if (!rparen) return -1;
     char *p = rparen + 2; 
-    char *save = NULL;
-    char *tok = strtok_r(p, " ", &save);
-    int idx = 0;
-    uint64_t utime = 0, stime = 0;
+    char *save = NULL; char *tok = strtok_r(p, " ", &save);
+    int idx = 0; uint64_t utime=0, stime=0;
     while (tok) {
-        if (idx == 11) {
-            utime = strtoull(tok, NULL, 10);
-        } else if (idx == 12) {
-            stime = strtoull(tok, NULL, 10);
-            break;
-        }
-        idx++;
-        tok = strtok_r(NULL, " ", &save);
+        if (idx == 11) utime = strtoull(tok, NULL, 10);
+        else if (idx == 12) { stime = strtoull(tok, NULL, 10); break; }
+        idx++; tok = strtok_r(NULL, " ", &save);
     }
     *cpu_jiffies_out = utime + stime;
     return 0;
@@ -258,11 +225,9 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
             sample_t s; memset(&s, 0, sizeof(s));
             s.pid = pid; s.tid = pid; s.key = make_key(pid, pid);
             snprintf(s.cmd, sizeof(s.cmd), "%s", cmd);
-            
             char io_path[PATH_MAX], stat_path[PATH_MAX];
             snprintf(io_path, sizeof(io_path), "/proc/%d/io", pid);
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
-            
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
             read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
             vec_push(out, &s);
@@ -279,11 +244,9 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
                 sample_t s; memset(&s, 0, sizeof(s));
                 s.pid = pid; s.tid = tid; s.key = make_key(pid, tid);
                 snprintf(s.cmd, sizeof(s.cmd), "%s", cmd);
-                
                 char io_path[PATH_MAX], stat_path[PATH_MAX];
                 snprintf(io_path, sizeof(io_path), "/proc/%d/task/%d/io", pid, tid);
                 snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
-                
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
                 read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
                 vec_push(out, &s);
@@ -317,9 +280,7 @@ static int get_term_cols(void) {
     int cols = 120;
     if (isatty(STDOUT_FILENO)) {
         struct winsize ws;
-        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
-            if (ws.ws_col > 0) cols = ws.ws_col;
-        }
+        if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) if (ws.ws_col > 0) cols = ws.ws_col;
     }
     return cols;
 }
@@ -338,7 +299,7 @@ typedef enum { SORT_PID=1, SORT_CPU, SORT_RIOPS, SORT_WIOPS, SORT_RMIB, SORT_WMI
 static int cmp_pid_desc(const void *a, const void *b) {
     const sample_t *x = (const sample_t *)a;
     const sample_t *y = (const sample_t *)b;
-    return (x->pid < y->pid) - (x->pid > y->pid); // PID desc usually not needed, but consistency
+    return (x->pid < y->pid) - (x->pid > y->pid); 
 }
 static int cmp_cpu_desc(const void *a, const void *b) {
     const sample_t *x = (const sample_t *)a;
@@ -367,8 +328,10 @@ static int cmp_wmib_desc(const void *a, const void *b) {
 }
 
 int main(int argc, char **argv) {
-    double interval = 1.0;
+    double interval = 5.0; // Default to 5 seconds
     int include_threads = 0;
+    int display_limit = 50; // Default to 50 lines
+    
     pid_t *filter = NULL;
     size_t filter_n = 0, filter_cap = 0;
 
@@ -402,7 +365,7 @@ int main(int argc, char **argv) {
     vec_t prev, curr;
     vec_init(&prev); vec_init(&curr);
     
-    printf("Initializing...\n");
+    printf("Initializing (wait %.0fs)...\n", interval);
     if (collect_samples(&prev, include_threads, filter, filter_n) != 0) return 1;
     qsort(prev.data, prev.len, sizeof(sample_t), cmp_key);
     double t_prev = now_monotonic();
@@ -437,8 +400,6 @@ int main(int argc, char **argv) {
             c->w_mib  = ((double)d_wb / dt) / 1048576.0;
         }
 
-        // Inner loop for display & input
-        // We re-sort and print if input changes sort order
         int dirty = 1;
         double start_wait = now_monotonic();
 
@@ -454,16 +415,21 @@ int main(int argc, char **argv) {
                 }
 
                 printf("\033[2J\033[H"); // Clear screen
+                
                 int cols = get_term_cols();
+                
+                // Top status bar with Refresh rate
+                printf("kvmtop - Refresh=%.1fs\n", interval);
+
                 int pidw = include_threads ? 11 : 7;
                 int cpuw = 8, iopsw = 10, mibw = 10;
                 int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + mibw+1 + mibw+1;
                 int cmdw = cols - fixed; if (cmdw < 10) cmdw = 10;
 
-                // Header with [N]
+                // Headers aligned to match %%*.*f formatting
                 char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32];
                 snprintf(h_pid, 32, "[1] %s", "PID");
-                snprintf(h_cpu, 32, "[2] %s", "CPU%");
+                snprintf(h_cpu, 32, "[2] %s", "CPU%%");
                 snprintf(h_ri, 32, "[3] %s", "R_IOPS");
                 snprintf(h_wi, 32, "[4] %s", "W_IOPS");
                 snprintf(h_rm, 32, "[5] %s", "R_MiB/s");
@@ -476,7 +442,9 @@ int main(int argc, char **argv) {
                 
                 for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
-                int limit = 20; if ((size_t)limit > curr.len) limit = curr.len;
+                int limit = display_limit; 
+                if ((size_t)limit > curr.len) limit = curr.len;
+                
                 for (int i=0; i<limit; i++) {
                     const sample_t *c = &curr.data[i];
                     char pidbuf[32];
@@ -504,7 +472,6 @@ int main(int argc, char **argv) {
             int c = wait_for_input(remain);
             if (c > 0) {
                 if (c == 'q' || c == 'Q') goto cleanup;
-                // Handle 1-6 and Ctrl-A(1) - Ctrl-F(6)
                 if (c == '1' || c == 0x01) { sort_col = SORT_PID; dirty = 1; }
                 if (c == '2' || c == 0x02) { sort_col = SORT_CPU; dirty = 1; }
                 if (c == '3' || c == 0x03) { sort_col = SORT_RIOPS; dirty = 1; }
@@ -512,7 +479,7 @@ int main(int argc, char **argv) {
                 if (c == '5' || c == 0x05) { sort_col = SORT_RMIB; dirty = 1; }
                 if (c == '6' || c == 0x06) { sort_col = SORT_WMIB; dirty = 1; }
             } else {
-                break; // Timeout, time to sample again
+                break;
             }
         }
 
