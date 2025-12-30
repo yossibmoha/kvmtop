@@ -1073,6 +1073,17 @@ int main(int argc, char **argv) {
                     int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 3, iopsw=10, waitw=8, mibw=10;
                     
                     // Headers
+                    int fixed_width = pidw + 1 + cpuw + 1 + 
+                                      memw + 1 + memw + 1 + memw + 1 + 
+                                      uptimew + 1 + userw + 1 + 
+                                      iopsw + 1 + iopsw + 1 + 
+                                      waitw + 1 + 
+                                      mibw + 1 + mibw + 1 + 
+                                      statew + 1;
+                                      
+                    int cmdw = cols - fixed_width; 
+                    if (cmdw < 10) cmdw = 10;
+
                     printf("%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
                         pidw, "[1] PID",
                         cpuw, "[2] CPU%",
