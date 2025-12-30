@@ -32,7 +32,21 @@ jobs:
         name: kvmtop-static-linux-amd64
         path: build/kvmtop-static-linux-amd64
 
-    - name: Release
+    - name: Generate Version Tag
+      id: tag
+      run: echo "VERSION=v$(date +'%Y.%m.%d').${{ github.run_number }}" >> $GITHUB_ENV
+
+    - name: Release Unique Version
+      uses: softprops/action-gh-release@v1
+      if: github.ref == 'refs/heads/main'
+      with:
+        tag_name: ${{ env.VERSION }}
+        name: Release ${{ env.VERSION }}
+        files: build/kvmtop-static-linux-amd64
+        draft: false
+        prerelease: false
+
+    - name: Update Latest Tag
       uses: softprops/action-gh-release@v1
       if: github.ref == 'refs/heads/main'
       with:
