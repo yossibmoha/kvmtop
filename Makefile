@@ -1,5 +1,8 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -static
+ifdef VERSION
+    CFLAGS += -DKVM_VERSION=\"$(VERSION)\"
+endif
 TARGET = kvmtop
 SRC_DIR = src
 BUILD_DIR = build

@@ -21,7 +21,9 @@
 #define CMD_MAX 512
 #endif
 
-#define KVM_VERSION "v1.0.1"
+#ifndef KVM_VERSION
+#define KVM_VERSION "v1.0.1-dev"
+#endif
 
 typedef enum {
     MODE_PROCESS = 0,
@@ -244,19 +246,20 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
 static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint64_t *read_bytes, uint64_t *write_bytes) {
     FILE *f = fopen(path, "r");
     if (!f) return -1;
-    uint64_t v_syscr=0, v_syscw=0, v_rbytes=0, v_wbytes=0;
+    
     char line[256];
     while (fgets(line, sizeof(line), f)) {
-        char key[64]; unsigned long long val = 0;
-        if (sscanf(line, "%63[^:]:\s%llu", key, &val) == 2) {
-            if (strcmp(key, "syscr") == 0) v_syscr = (uint64_t)val;
-            else if (strcmp(key, "syscw") == 0) v_syscw = (uint64_t)val;
-            else if (strcmp(key, "read_bytes") == 0) v_rbytes = (uint64_t)val;
-            else if (strcmp(key, "write_bytes") == 0) v_wbytes = (uint64_t)val;
+        if (strncmp(line, "syscr:", 6) == 0) {
+            *syscr = strtoull(line + 6, NULL, 10);
+        } else if (strncmp(line, "syscw:", 6) == 0) {
+            *syscw = strtoull(line + 6, NULL, 10);
+        } else if (strncmp(line, "read_bytes:", 11) == 0) {
+            *read_bytes = strtoull(line + 11, NULL, 10);
+        } else if (strncmp(line, "write_bytes:", 12) == 0) {
+            *write_bytes = strtoull(line + 12, NULL, 10);
         }
     }
     fclose(f);
-    *syscr = v_syscr; *syscw = v_syscw; *read_bytes = v_rbytes; *write_bytes = v_wbytes;
     return 0;
 }
 
