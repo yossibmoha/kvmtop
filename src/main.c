@@ -446,8 +446,10 @@ int main(int argc, char **argv) {
                 snprintf(h_rm, 32, "[5] %s", "R_MiB/s");
                 snprintf(h_wm, 32, "[6] %s", "W_MiB/s");
 
-                printf("%*s %*s %*s %*s %*s %*s %s\n",
-                    pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm, "COMMAND");
+                printf("%*s %*s %*s %*s %*s %*s ",
+                    pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm);
+                fprint_trunc(stdout, "COMMAND", cmdw);
+                putchar('\n');
                 
                 for(int i=0; i<cols; i++) putchar('-');
                 putchar('\n');
@@ -471,27 +473,27 @@ int main(int argc, char **argv) {
                     if (include_threads) snprintf(pidbuf, sizeof(pidbuf), "%d:%d", c->pid, c->tid);
                     else snprintf(pidbuf, sizeof(pidbuf), "%d", c->pid);
                     
-                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %s\n",
+                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f ",
                         pidw, pidbuf,
                         cpuw, 2, c->cpu_pct,
                         iopsw, 2, c->r_iops,
                         iopsw, 2, c->w_iops,
                         mibw, 2, c->r_mib,
-                        mibw, 2, c->w_mib,
-                        c->cmd);
+                        mibw, 2, c->w_mib);
+                    fprint_trunc(stdout, c->cmd, cmdw);
+                    putchar('\n');
                 }
 
                 // Print Total Row
                 for(int i=0; i<cols; i++) putchar('-');
                 putchar('\n');
-                printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %s\n",
+                printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f \n",
                         pidw, "TOTAL",
                         cpuw, 2, t_cpu,
                         iopsw, 2, t_ri,
                         iopsw, 2, t_wi,
                         mibw, 2, t_rm,
-                        mibw, 2, t_wm,
-                        "");
+                        mibw, 2, t_wm);
                 fflush(stdout);
                 dirty = 0;
             }
