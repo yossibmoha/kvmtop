@@ -173,7 +173,7 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char key[64]; unsigned long long val = 0;
-        if (sscanf(line, "%63[^:]:\s%llu", key, &val) == 2) {
+        if (sscanf(line, "%63[^:]: %llu", key, &val) == 2) {
             if (strcmp(key, "syscr") == 0) v_syscr = (uint64_t)val;
             else if (strcmp(key, "syscw") == 0) v_syscw = (uint64_t)val;
             else if (strcmp(key, "read_bytes") == 0) v_rbytes = (uint64_t)val;
