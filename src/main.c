@@ -33,9 +33,9 @@ typedef enum {
 
 // --- Data Structures ---
 typedef struct {
-    pid_t pid;  // This is the TID (Thread ID)
-    pid_t tgid; // This is the Process ID (Thread Group ID)
-    uint64_t key; // Unique key (usually just pid/tid)
+    pid_t pid;
+    pid_t tgid;
+    uint64_t key; 
 
     uint64_t syscr;
     uint64_t syscw;
@@ -62,9 +62,8 @@ typedef struct {
 
 typedef struct {
     char name[32];
-    char operstate[16]; // up/down/unknown
+    char operstate[16]; 
     
-    // Counters
     uint64_t rx_bytes;
     uint64_t tx_bytes;
     uint64_t rx_packets;
@@ -72,11 +71,9 @@ typedef struct {
     uint64_t rx_errors;
     uint64_t tx_errors;
 
-    // KVM Metadata
     int vmid;
     char vm_name[64];
 
-    // Rates (Calculated)
     double rx_mbps;
     double tx_mbps;
     double rx_pps;
@@ -229,17 +226,23 @@ static void sanitize_cmd(char out[CMD_MAX], const char *in, size_t in_len) {
 static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
     char path[PATH_MAX], buf[8192];
     ssize_t n = 0;
+    
+    // Try /proc/[pid]/cmdline first
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n);
         if (out[0] != '\0') return 0;
     }
+
+    // Fallback to /proc/[pid]/comm
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
-        sanitize_cmd(out, buf, (size_t)n);
+        // Comm usually has a newline at the end, sanitize handles it
+        sanitize_cmd(out, buf, (size_t)n); 
         if (out[0] != '\0') return 0;
     }
-    snprintf(out, CMD_MAX, "%s", "?");
+
+    snprintf(out, CMD_MAX, "?");
     return -1;
 }
 
@@ -276,7 +279,7 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     while (tok) {
         if (idx == 11) utime = strtoull(tok, NULL, 10);
         else if (idx == 12) stime = strtoull(tok, NULL, 10);
-        else if (idx == 39) { // Field 42 (42 - 3 = 39)
+        else if (idx == 39) { // Field 42
             *blkio_ticks_out = strtoull(tok, NULL, 10);
             break; 
         }
@@ -640,6 +643,7 @@ int main(int argc, char **argv) {
     double interval = 5.0; 
     int display_limit = 50;
     int show_tree = 0;
+    int frozen = 0;
     display_mode_t mode = MODE_PROCESS;
     
     pid_t *filter = NULL;
@@ -688,78 +692,84 @@ int main(int argc, char **argv) {
 
     qsort(prev.data, prev.len, sizeof(sample_t), cmp_key);
     double t_prev = now_monotonic();
+    
+    double sys_r_iops = 0, sys_w_iops = 0;
 
     enable_raw_mode();
     sort_col_t sort_col_proc = SORT_CPU;
     sort_col_t sort_col_net = SORT_NET_TX;
 
     while (1) {
-        vec_free(&curr_raw); vec_init(&curr_raw);
-        collect_samples(&curr_raw, filter, filter_n);
-        
-        vec_net_free(&curr_net); vec_net_init(&curr_net);
-        collect_net_dev(&curr_net);
-        map_kvm_interfaces(&curr_net);
+        if (!frozen) {
+            vec_free(&curr_raw); vec_init(&curr_raw);
+            collect_samples(&curr_raw, filter, filter_n);
+            
+            vec_net_free(&curr_net); vec_net_init(&curr_net);
+            collect_net_dev(&curr_net);
+            map_kvm_interfaces(&curr_net);
 
-        read_system_disk_iops(&curr_sys_r, &curr_sys_w);
+            read_system_disk_iops(&curr_sys_r, &curr_sys_w);
 
-        double t_curr = now_monotonic();
-        double dt = t_curr - t_prev;
-        if (dt <= 0) dt = interval;
+            double t_curr = now_monotonic();
+            double dt = t_curr - t_prev;
+            if (dt <= 0) dt = interval;
 
-        double sys_r_iops = (double)(curr_sys_r - prev_sys_r) / dt;
-        double sys_w_iops = (double)(curr_sys_w - prev_sys_w) / dt;
+            sys_r_iops = (double)(curr_sys_r - prev_sys_r) / dt;
+            sys_w_iops = (double)(curr_sys_w - prev_sys_w) / dt;
 
-        // Process Metrics
-        for (size_t i=0; i<curr_raw.len; i++) {
-            sample_t *c = &curr_raw.data[i];
-            const sample_t *p = find_prev(&prev, c->key);
-            uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0, d_blk=0;
-            if (p) {
-                d_cpu = (c->cpu_jiffies >= p->cpu_jiffies) ? c->cpu_jiffies - p->cpu_jiffies : 0;
-                d_scr = (c->syscr >= p->syscr) ? c->syscr - p->syscr : 0;
-                d_scw = (c->syscw >= p->syscw) ? c->syscw - p->syscw : 0;
-                d_rb  = (c->read_bytes >= p->read_bytes) ? c->read_bytes - p->read_bytes : 0;
-                d_wb  = (c->write_bytes >= p->write_bytes) ? c->write_bytes - p->write_bytes : 0;
-                d_blk = (c->blkio_ticks >= p->blkio_ticks) ? c->blkio_ticks - p->blkio_ticks : 0;
+            // Process Metrics
+            for (size_t i=0; i<curr_raw.len; i++) {
+                sample_t *c = &curr_raw.data[i];
+                const sample_t *p = find_prev(&prev, c->key);
+                uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0, d_blk=0;
+                if (p) {
+                    d_cpu = (c->cpu_jiffies >= p->cpu_jiffies) ? c->cpu_jiffies - p->cpu_jiffies : 0;
+                    d_scr = (c->syscr >= p->syscr) ? c->syscr - p->syscr : 0;
+                    d_scw = (c->syscw >= p->syscw) ? c->syscw - p->syscw : 0;
+                    d_rb  = (c->read_bytes >= p->read_bytes) ? c->read_bytes - p->read_bytes : 0;
+                    d_wb  = (c->write_bytes >= p->write_bytes) ? c->write_bytes - p->write_bytes : 0;
+                    d_blk = (c->blkio_ticks >= p->blkio_ticks) ? c->blkio_ticks - p->blkio_ticks : 0;
+                }
+                c->cpu_pct = ((double)d_cpu * 100.0) / (dt * (double)hz);
+                c->r_iops = (double)d_scr / dt;
+                c->w_iops = (double)d_scw / dt;
+                c->r_mib  = ((double)d_rb / dt) / 1048576.0;
+                c->w_mib  = ((double)d_wb / dt) / 1048576.0;
+                c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
             }
-            c->cpu_pct = ((double)d_cpu * 100.0) / (dt * (double)hz);
-            c->r_iops = (double)d_scr / dt;
-            c->w_iops = (double)d_scw / dt;
-            c->r_mib  = ((double)d_rb / dt) / 1048576.0;
-            c->w_mib  = ((double)d_wb / dt) / 1048576.0;
-            c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
-        }
 
-        // Net Metrics
-        for (size_t i=0; i<curr_net.len; i++) {
-            net_iface_t *cn = &curr_net.data[i];
-            net_iface_t *pn = NULL;
-            for(size_t j=0; j<prev_net.len; j++) {
-                if (strcmp(prev_net.data[j].name, cn->name) == 0) {
-                    pn = &prev_net.data[j];
-                    break;
+            // Net Metrics
+            for (size_t i=0; i<curr_net.len; i++) {
+                net_iface_t *cn = &curr_net.data[i];
+                net_iface_t *pn = NULL;
+                for(size_t j=0; j<prev_net.len; j++) {
+                    if (strcmp(prev_net.data[j].name, cn->name) == 0) {
+                        pn = &prev_net.data[j];
+                        break;
+                    }
+                }
+                if (pn) {
+                    uint64_t dr = (cn->rx_bytes >= pn->rx_bytes) ? cn->rx_bytes - pn->rx_bytes : 0;
+                    uint64_t dtb = (cn->tx_bytes >= pn->tx_bytes) ? cn->tx_bytes - pn->tx_bytes : 0;
+                    uint64_t dp_r = (cn->rx_packets >= pn->rx_packets) ? cn->rx_packets - pn->rx_packets : 0;
+                    uint64_t dp_t = (cn->tx_packets >= pn->tx_packets) ? cn->tx_packets - pn->tx_packets : 0;
+                    uint64_t de_r = (cn->rx_errors >= pn->rx_errors) ? cn->rx_errors - pn->rx_errors : 0;
+                    uint64_t de_t = (cn->tx_errors >= pn->tx_errors) ? cn->tx_errors - pn->tx_errors : 0;
+
+                    cn->rx_mbps = ((double)dr * 8.0) / (dt * 1000000.0);
+                    cn->tx_mbps = ((double)dtb * 8.0) / (dt * 1000000.0);
+                    cn->rx_pps = (double)dp_r / dt;
+                    cn->tx_pps = (double)dp_t / dt;
+                    cn->rx_errs_ps = (double)de_r / dt;
+                    cn->tx_errs_ps = (double)de_t / dt;
                 }
             }
-            if (pn) {
-                uint64_t dr = (cn->rx_bytes >= pn->rx_bytes) ? cn->rx_bytes - pn->rx_bytes : 0;
-                uint64_t dtb = (cn->tx_bytes >= pn->tx_bytes) ? cn->tx_bytes - pn->tx_bytes : 0;
-                uint64_t dp_r = (cn->rx_packets >= pn->rx_packets) ? cn->rx_packets - pn->rx_packets : 0;
-                uint64_t dp_t = (cn->tx_packets >= pn->tx_packets) ? cn->tx_packets - pn->tx_packets : 0;
-                uint64_t de_r = (cn->rx_errors >= pn->rx_errors) ? cn->rx_errors - pn->rx_errors : 0;
-                uint64_t de_t = (cn->tx_errors >= pn->tx_errors) ? cn->tx_errors - pn->tx_errors : 0;
 
-                cn->rx_mbps = ((double)dr * 8.0) / (dt * 1000000.0);
-                cn->tx_mbps = ((double)dtb * 8.0) / (dt * 1000000.0);
-                cn->rx_pps = (double)dp_r / dt;
-                cn->tx_pps = (double)dp_t / dt;
-                cn->rx_errs_ps = (double)de_r / dt;
-                cn->tx_errs_ps = (double)de_t / dt;
-            }
+            vec_free(&curr_proc); 
+            aggregate_by_tgid(&curr_raw, &curr_proc);
+            
+            t_prev = t_curr;
         }
-
-        vec_free(&curr_proc); 
-        aggregate_by_tgid(&curr_raw, &curr_proc);
 
         int dirty = 1;
         double start_wait = now_monotonic();
@@ -771,7 +781,8 @@ int main(int argc, char **argv) {
                 
                 char left[128], right[128];
                 snprintf(left, sizeof(left), "kvmtop %s", KVM_VERSION);
-                snprintf(right, sizeof(right), "Refresh=%.1fs | [n] Net | [t] Tree | [1-7] Sort | [q] Quit", interval);
+                snprintf(right, sizeof(right), "Refresh=%.1fs | [n] Net | [t] Tree | [f] Freeze: %s | [1-7] Sort | [q] Quit", 
+                         interval, frozen ? "ON" : "OFF");
                 
                 int pad = cols - (int)strlen(left) - (int)strlen(right);
                 if (pad < 1) pad = 1;
@@ -799,7 +810,7 @@ int main(int argc, char **argv) {
                     for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
                     int count = 0;
-                    for(size_t i=0; i<curr_net.len && count < 25; i++) {
+                    for(size_t i=0; i<curr_net.len && count < 50; i++) {
                         net_iface_t *n = &curr_net.data[i];
                         if (strncmp(n->name, "fw", 2) == 0 || strcmp(n->name, "lo")==0) continue;
 
@@ -830,9 +841,9 @@ int main(int argc, char **argv) {
 
                     int pidw = 14; 
                     int cpuw = 8, iopsw = 10, mibw = 10, waitw=10;
-                    int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + waitw+1 + mibw+1 + mibw+1;
-                    int cmdw = cols - fixed; if (cmdw < 10) cmdw = 10;
-
+                    // Fix alignment logic
+                    // Ensure padding matches the headers
+                    
                     char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
                     snprintf(h_pid, 32, "[1] %s", "PID");
                     snprintf(h_cpu, 32, "[2] %s", "CPU%%");
@@ -842,10 +853,12 @@ int main(int argc, char **argv) {
                     snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
                     snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
 
-                    printf("%*s %*s %*s %*s %*s %*s %*s ",
-                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm);
-                    fprint_trunc(stdout, "COMMAND", cmdw);
-                    putchar('\n');
+                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1;
+                    int cmdw = cols - fixed_width; 
+                    if (cmdw < 10) cmdw = 10;
+
+                    printf("%*s %*s %*s %*s %*s %*s %*s %s\n",
+                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, "COMMAND LINE");
                     
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
@@ -865,7 +878,6 @@ int main(int argc, char **argv) {
                     
                     for (int i=0; i<limit; i++) {
                         const sample_t *c = &view_list->data[i];
-                        
                         char pidbuf[32];
                         snprintf(pidbuf, sizeof(pidbuf), "%d", c->tgid);
                         
@@ -907,6 +919,7 @@ int main(int argc, char **argv) {
             int c = wait_for_input(remain);
             if (c > 0) {
                 if (c == 'q' || c == 'Q') goto cleanup;
+                if (c == 'f' || c == 'F') { frozen = !frozen; dirty = 1; }
                 if (c == 't' || c == 'T') { show_tree = !show_tree; dirty = 1; }
                 if (c == 'n' || c == 'N') { mode = (mode == MODE_NETWORK) ? MODE_PROCESS : MODE_NETWORK; dirty = 1; }
                 
@@ -925,12 +938,13 @@ int main(int argc, char **argv) {
             }
         }
 
-        qsort(curr_raw.data, curr_raw.len, sizeof(sample_t), cmp_key);
-        vec_free(&prev); prev = curr_raw; vec_init(&curr_raw);
-        vec_net_free(&prev_net); prev_net = curr_net; vec_net_init(&curr_net);
-        t_prev = t_curr;
-        prev_sys_r = curr_sys_r;
-        prev_sys_w = curr_sys_w;
+        if (!frozen) {
+            qsort(curr_raw.data, curr_raw.len, sizeof(sample_t), cmp_key);
+            vec_free(&prev); prev = curr_raw; vec_init(&curr_raw);
+            vec_net_free(&prev_net); prev_net = curr_net; vec_net_init(&curr_net);
+            prev_sys_r = curr_sys_r;
+            prev_sys_w = curr_sys_w;
+        }
     }
 
 cleanup:
