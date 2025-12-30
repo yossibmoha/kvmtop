@@ -73,10 +73,12 @@ typedef struct {
     uint64_t read_bytes;
     uint64_t write_bytes;
     uint64_t cpu_jiffies;
+    uint64_t blkio_ticks;
 
     double cpu_pct;
     double r_iops;
     double w_iops;
+    double io_wait_ms;
     double r_mib;
     double w_mib;
 
@@ -185,7 +187,7 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     return 0;
 }
 
-static int read_cpu_jiffies_from_stat(const char *path, uint64_t *cpu_jiffies_out) {
+static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out) {
     char buf[4096]; ssize_t n = 0;
     if (read_small_file(path, buf, sizeof(buf), &n) != 0 || n <= 0) return -1;
     char *rparen = strrchr(buf, ')');
@@ -193,9 +195,15 @@ static int read_cpu_jiffies_from_stat(const char *path, uint64_t *cpu_jiffies_ou
     char *p = rparen + 2; 
     char *save = NULL; char *tok = strtok_r(p, " ", &save);
     int idx = 0; uint64_t utime=0, stime=0;
+    *blkio_ticks_out = 0;
+    
     while (tok) {
         if (idx == 11) utime = strtoull(tok, NULL, 10);
-        else if (idx == 12) { stime = strtoull(tok, NULL, 10); break; }
+        else if (idx == 12) stime = strtoull(tok, NULL, 10);
+        else if (idx == 39) { // Field 42 (42 - 3 = 39)
+            *blkio_ticks_out = strtoull(tok, NULL, 10);
+            break; 
+        }
         idx++; tok = strtok_r(NULL, " ", &save);
     }
     *cpu_jiffies_out = utime + stime;
@@ -232,7 +240,7 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
             // Try reading IO, ignore failure (s.syscr etc are already 0 from memset)
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
             
-            read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
+            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks);
             vec_push(out, &s);
         } else {
             char taskdir_path[PATH_MAX];
@@ -254,7 +262,7 @@ static int collect_samples(vec_t *out, int include_threads, const pid_t *filter_
                 // Try reading IO, ignore failure
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
                 
-                read_cpu_jiffies_from_stat(stat_path, &s.cpu_jiffies);
+                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks);
                 vec_push(out, &s);
             }
             closedir(taskdir);
@@ -396,19 +404,22 @@ int main(int argc, char **argv) {
         for (size_t i=0; i<curr.len; i++) {
             sample_t *c = &curr.data[i];
             const sample_t *p = find_prev(&prev, c->key);
-            uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0;
+            uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0, d_blk=0;
             if (p) {
                 d_cpu = (c->cpu_jiffies >= p->cpu_jiffies) ? c->cpu_jiffies - p->cpu_jiffies : 0;
                 d_scr = (c->syscr >= p->syscr) ? c->syscr - p->syscr : 0;
                 d_scw = (c->syscw >= p->syscw) ? c->syscw - p->syscw : 0;
                 d_rb  = (c->read_bytes >= p->read_bytes) ? c->read_bytes - p->read_bytes : 0;
                 d_wb  = (c->write_bytes >= p->write_bytes) ? c->write_bytes - p->write_bytes : 0;
+                d_blk = (c->blkio_ticks >= p->blkio_ticks) ? c->blkio_ticks - p->blkio_ticks : 0;
             }
             c->cpu_pct = ((double)d_cpu * 100.0) / (dt * (double)hz);
             c->r_iops = (double)d_scr / dt;
             c->w_iops = (double)d_scw / dt;
             c->r_mib  = ((double)d_rb / dt) / 1048576.0;
             c->w_mib  = ((double)d_wb / dt) / 1048576.0;
+            c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; // blkio_ticks are in USER_HZ usually? No, Linux doc says "clock ticks".
+            // Actually: man proc says "clock ticks". sysconf(_SC_CLK_TCK) is usually 100.
         }
 
         int dirty = 1;
@@ -433,21 +444,22 @@ int main(int argc, char **argv) {
                 printf("kvmtop - Refresh=%.1fs\n", interval);
 
                 int pidw = include_threads ? 11 : 7;
-                int cpuw = 8, iopsw = 10, mibw = 10;
-                int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + mibw+1 + mibw+1;
+                int cpuw = 8, iopsw = 10, mibw = 10, waitw=10;
+                int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + waitw+1 + mibw+1 + mibw+1;
                 int cmdw = cols - fixed; if (cmdw < 10) cmdw = 10;
 
                 // Headers aligned to match %*.*f formatting
-                char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32];
+                char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
                 snprintf(h_pid, 32, "[1] %s", "PID");
                 snprintf(h_cpu, 32, "[2] %s", "CPU%%");
                 snprintf(h_ri, 32, "[3] %s", "R_Sys");
                 snprintf(h_wi, 32, "[4] %s", "W_Sys");
-                snprintf(h_rm, 32, "[5] %s", "R_MiB/s");
-                snprintf(h_wm, 32, "[6] %s", "W_MiB/s");
+                snprintf(h_wt, 32, "[5] %s", "IO_Wait");
+                snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
+                snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
 
-                printf("%*s %*s %*s %*s %*s %*s ",
-                    pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm);
+                printf("%*s %*s %*s %*s %*s %*s %*s ",
+                    pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm);
                 fprint_trunc(stdout, "COMMAND", cmdw);
                 putchar('\n');
                 
@@ -455,13 +467,14 @@ int main(int argc, char **argv) {
                 putchar('\n');
 
                 // Calculate Totals
-                double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0;
+                double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
                 for(size_t i=0; i<curr.len; i++) {
                     t_cpu += curr.data[i].cpu_pct;
                     t_ri  += curr.data[i].r_iops;
                     t_wi  += curr.data[i].w_iops;
                     t_rm  += curr.data[i].r_mib;
                     t_wm  += curr.data[i].w_mib;
+                    t_wt  += curr.data[i].io_wait_ms;
                 }
 
                 int limit = display_limit; 
@@ -473,11 +486,12 @@ int main(int argc, char **argv) {
                     if (include_threads) snprintf(pidbuf, sizeof(pidbuf), "%d:%d", c->pid, c->tid);
                     else snprintf(pidbuf, sizeof(pidbuf), "%d", c->pid);
                     
-                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f ",
+                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
                         pidw, pidbuf,
                         cpuw, 2, c->cpu_pct,
                         iopsw, 2, c->r_iops,
                         iopsw, 2, c->w_iops,
+                        waitw, 2, c->io_wait_ms,
                         mibw, 2, c->r_mib,
                         mibw, 2, c->w_mib);
                     fprint_trunc(stdout, c->cmd, cmdw);
@@ -487,15 +501,15 @@ int main(int argc, char **argv) {
                 // Print Total Row
                 for(int i=0; i<cols; i++) putchar('-');
                 putchar('\n');
-                printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f \n",
+                printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
                         pidw, "TOTAL",
                         cpuw, 2, t_cpu,
                         iopsw, 2, t_ri,
                         iopsw, 2, t_wi,
+                        waitw, 2, t_wt,
                         mibw, 2, t_rm,
                         mibw, 2, t_wm);
-                fflush(stdout);
-                dirty = 0;
+
             }
 
             double elapsed = now_monotonic() - start_wait;
