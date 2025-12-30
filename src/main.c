@@ -1136,9 +1136,9 @@ int main(int argc, char **argv) {
 
                 if (mode == MODE_NETWORK) {
                     if (sort_col_net == SORT_NET_RX) 
-                        qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_rx_desc);
+                        qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_rx);
                     else
-                        qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_tx_desc);
+                        qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_tx);
 
                     int namew=16, statw=10, ratew=12, pktw=10, errw=8;
                     char h_rx[32], h_tx[32];
@@ -1178,7 +1178,7 @@ int main(int argc, char **argv) {
                         count++;
                     }
                 } else if (mode == MODE_STORAGE) {
-                    qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio_desc); 
+                    qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio); 
 
                     int devw=16, iopsw=12, mibw=12;
                     char h_ri[32], h_wi[32], h_rm[32], h_wm[32];
@@ -1207,14 +1207,14 @@ int main(int argc, char **argv) {
                     vec_t *view_list = &curr_proc; 
 
                     switch(sort_col_proc) {
-                        case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid_desc); break;
-                        case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
-                        case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr_desc); break;
-                        case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw_desc); break;
-                        case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait_desc); break;
-                        case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib_desc); break;
-                        case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib_desc); break;
-                        default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
+                        case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid); break;
+                        case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu); break;
+                        case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr); break;
+                        case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw); break;
+                        case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait); break;
+                        case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib); break;
+                        case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib); break;
+                        default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu); break;
                     }
 
                     // Column Widths
