@@ -229,7 +229,7 @@ static int get_term_cols(void) {
 static void fprint_trunc(FILE *out, const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
-    if (len <= width) fprintf(out, "%-*s", width, s);
+    if (len <= width) fprintf(out, "%*s", width, s);
     else if (width <= 3) fprintf(out, "%.*s", width, s);
     else fprintf(out, "%.*s...", width - 3, s);
 }
@@ -271,18 +271,21 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
     char path[PATH_MAX], buf[8192];
     ssize_t n = 0;
     
+    // 1. Try /proc/[pid]/cmdline
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n);
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
+    // 2. Try /proc/[pid]/comm
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n); 
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
+    // 3. Try parsing name from /proc/[pid]/stat
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         char *start = strchr(buf, '(');
@@ -705,6 +708,12 @@ static int cmp_disk_rio(const void *a, const void *b) {
     return CMP_NUM(x->r_iops, y->r_iops);
 }
 
+static int cmp_tgid(const void *a, const void *b) {
+    const sample_t *x = (const sample_t *)a;
+    const sample_t *y = (const sample_t *)b;
+    return (x->tgid > y->tgid) - (x->tgid < y->tgid);
+}
+
 // Aggregate threads into process-level stats
 static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
     vec_init(dst);
@@ -714,11 +723,6 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
     }
     
     // 2. Sort by TGID
-    int cmp_tgid(const void *a, const void *b) {
-        const sample_t *x = (const sample_t *)a;
-        const sample_t *y = (const sample_t *)b;
-        return (x->tgid > y->tgid) - (x->tgid < y->tgid);
-    }
     qsort(dst->data, dst->len, sizeof(sample_t), cmp_tgid);
 
     // 3. Merge adjacent with same TGID
@@ -733,7 +737,7 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
                 dst->data[write_idx].io_wait_ms += dst->data[i].io_wait_ms;
                 dst->data[write_idx].r_mib += dst->data[i].r_mib;
                 dst->data[write_idx].w_mib += dst->data[i].w_mib;
-                // Keep the PID of the TGID (usually the main thread) or just use TGID
+                
                 dst->data[write_idx].pid = dst->data[write_idx].tgid; 
                 dst->data[write_idx].state = dst->data[i].state; 
             } else {
@@ -747,7 +751,7 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
 }
 
 // Tree view helper
-static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int cols, int pidw, int cpuw, int iopsw, int waitw, int mibw, int cmdw) {
+static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int cpuw, int iopsw, int waitw, int mibw, int cmdw) {
     for (size_t i = 0; i < raw->len; i++) {
         const sample_t *s = &raw->data[i];
         if (s->tgid == tgid && s->pid != tgid) { 
@@ -829,7 +833,7 @@ int main(int argc, char **argv) {
     uint64_t curr_sys_r=0, curr_sys_w=0;
     read_system_disk_iops(&prev_sys_r, &prev_sys_w);
 
-    printf("Initializing (wait %.0fs)...\n", interval);
+    printf("Initializing (wait %.0fs)...\\n", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
@@ -1061,12 +1065,22 @@ int main(int argc, char **argv) {
                     }
 
                     // Column Widths
-                    int pidw = 10, userw = 10, uptimew=10, memw = 10;
-                    int logw=10, waitw=8, mibw=10, cpuw=8, statew=3;
+                    int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 3, iopsw=10, waitw=8, mibw=10;
                     
-                    // Rearranged Headers
+                    // Headers
                     // Order: PID, User, Uptime, Res, Shr, Virt, R_Log, W_Log, Wait, R_MiB, W_MiB, CPU, State, COMMAND
                     
+                    int fixed_width = pidw + 1 + cpuw + 1 + 
+                                      memw + 1 + memw + 1 + memw + 1 + 
+                                      uptimew + 1 + userw + 1 + 
+                                      iopsw + 1 + iopsw + 1 + 
+                                      waitw + 1 + 
+                                      mibw + 1 + mibw + 1 + 
+                                      statew + 1;
+                                      
+                    int cmdw = cols - fixed_width; 
+                    if (cmdw < 10) cmdw = 10;
+
                     printf("%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
                         pidw, "[1] PID",
                         userw, "User",
@@ -1084,15 +1098,6 @@ int main(int argc, char **argv) {
                         "COMMAND LINE"
                     );
                     
-                    int fixed_width = pidw+1 + userw+1 + uptimew+1 + 
-                                      memw+1 + memw+1 + memw+1 + 
-                                      logw+1 + logw+1 + waitw+1 + 
-                                      mibw+1 + mibw+1 + 
-                                      cpuw+1 + statew+1;
-                    
-                    int cmdw = cols - fixed_width; 
-                    if (cmdw < 10) cmdw = 10;
-
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
 
@@ -1160,8 +1165,7 @@ int main(int argc, char **argv) {
                         putchar('\n');
 
                         if (show_tree) {
-                            // Tree indent - simplistic
-                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, logw, waitw, mibw, cmdw);
+                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, logw, waitw, mibw, cmdw);
                         }
                     }
 
