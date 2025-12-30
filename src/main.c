@@ -23,6 +23,12 @@
 
 #define KVM_VERSION "v1.0.1"
 
+typedef enum {
+    MODE_PROCESS = 0,
+    MODE_TREE,
+    MODE_NETWORK
+} display_mode_t;
+
 // --- Data Structures ---
 typedef struct {
     pid_t pid;  // This is the TID (Thread ID)
@@ -52,6 +58,37 @@ typedef struct {
     size_t cap;
 } vec_t;
 
+typedef struct {
+    char name[32];
+    char operstate[16]; // up/down/unknown
+    
+    // Counters
+    uint64_t rx_bytes;
+    uint64_t tx_bytes;
+    uint64_t rx_packets;
+    uint64_t tx_packets;
+    uint64_t rx_errors;
+    uint64_t tx_errors;
+
+    // KVM Metadata
+    int vmid;
+    char vm_name[64];
+
+    // Rates (Calculated)
+    double rx_mbps;
+    double tx_mbps;
+    double rx_pps;
+    double tx_pps;
+    double rx_errs_ps;
+    double tx_errs_ps;
+} net_iface_t;
+
+typedef struct {
+    net_iface_t *data;
+    size_t len;
+    size_t cap;
+} vec_net_t;
+
 // --- Helper Functions ---
 
 static void vec_init(vec_t *v) { v->data=NULL; v->len=0; v->cap=0; }
@@ -60,6 +97,19 @@ static void vec_push(vec_t *v, const sample_t *item) {
     if (v->len == v->cap) {
         size_t new_cap = v->cap ? v->cap * 2 : 4096;
         sample_t *p = (sample_t *)realloc(v->data, new_cap * sizeof(*p));
+        if (!p) { fprintf(stderr, "OOM\n"); exit(2); }
+        v->data = p;
+        v->cap = new_cap;
+    }
+    v->data[v->len++] = *item;
+}
+
+static void vec_net_init(vec_net_t *v) { v->data=NULL; v->len=0; v->cap=0; }
+static void vec_net_free(vec_net_t *v) { free(v->data); v->data=NULL; v->len=0; v->cap=0; }
+static void vec_net_push(vec_net_t *v, const net_iface_t *item) {
+    if (v->len == v->cap) {
+        size_t new_cap = v->cap ? v->cap * 2 : 64;
+        net_iface_t *p = (net_iface_t *)realloc(v->data, new_cap * sizeof(*p));
         if (!p) { fprintf(stderr, "OOM\n"); exit(2); }
         v->data = p;
         v->cap = new_cap;
@@ -133,40 +183,6 @@ static int get_term_cols(void) {
     return cols;
 }
 
-// --- Disk Stats ---
-static int read_system_disk_iops(uint64_t *r_iops, uint64_t *w_iops) {
-    FILE *f = fopen("/proc/diskstats", "r");
-    if (!f) return -1;
-    
-    char line[512];
-    uint64_t tr = 0, tw = 0;
-    
-    while (fgets(line, sizeof(line), f)) {
-        int major, minor;
-        char name[64];
-        uint64_t rio, rmerge, rsect, ruse;
-        uint64_t wio, wmerge, wsect, wuse;
-        
-        if (sscanf(line, "%d %d %s %llu %llu %llu %llu %llu %llu %llu %llu",
-                   &major, &minor, name,
-                   &rio, &rmerge, &rsect, &ruse,
-                   &wio, &wmerge, &wsect, &wuse) == 11) {
-            
-            if (strncmp(name, "sd", 2) == 0 || 
-                strncmp(name, "vd", 2) == 0 ||
-                strncmp(name, "nvme", 4) == 0 ||
-                strncmp(name, "xvd", 3) == 0) {
-                tr += rio;
-                tw += wio;
-            }
-        }
-    }
-    fclose(f);
-    *r_iops = tr;
-    *w_iops = tw;
-    return 0;
-}
-
 static void fprint_trunc(FILE *out, const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
@@ -232,7 +248,7 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     char line[256];
     while (fgets(line, sizeof(line), f)) {
         char key[64]; unsigned long long val = 0;
-        if (sscanf(line, "%63[^:]: %llu", key, &val) == 2) {
+        if (sscanf(line, "%63[^:]:\s%llu", key, &val) == 2) {
             if (strcmp(key, "syscr") == 0) v_syscr = (uint64_t)val;
             else if (strcmp(key, "syscw") == 0) v_syscw = (uint64_t)val;
             else if (strcmp(key, "read_bytes") == 0) v_rbytes = (uint64_t)val;
@@ -266,6 +282,147 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     *cpu_jiffies_out = utime + stime;
     return 0;
 }
+
+static void read_operstate(const char *ifname, char *buf, size_t buflen) {
+    char path[256];
+    snprintf(path, sizeof(path), "/sys/class/net/%s/operstate", ifname);
+    ssize_t n;
+    if (read_small_file(path, buf, buflen, &n) == 0 && n > 0) {
+        if (buf[n-1] == '\n') buf[n-1] = '\0';
+    } else {
+        strncpy(buf, "?", buflen);
+    }
+}
+
+// --- System Stats ---
+
+static int read_system_disk_iops(uint64_t *r_iops, uint64_t *w_iops) {
+    FILE *f = fopen("/proc/diskstats", "r");
+    if (!f) return -1;
+    
+    char line[512];
+    uint64_t tr = 0, tw = 0;
+    
+    while (fgets(line, sizeof(line), f)) {
+        int major, minor;
+        char name[64];
+        uint64_t rio, rmerge, rsect, ruse;
+        uint64_t wio, wmerge, wsect, wuse;
+        
+        if (sscanf(line, "%d %d %s %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &major, &minor, name,
+                   &rio, &rmerge, &rsect, &ruse,
+                   &wio, &wmerge, &wsect, &wuse) == 11) {
+            
+            if (strncmp(name, "sd", 2) == 0 || 
+                strncmp(name, "vd", 2) == 0 ||
+                strncmp(name, "nvme", 4) == 0 ||
+                strncmp(name, "xvd", 3) == 0) {
+                tr += rio;
+                tw += wio;
+            }
+        }
+    }
+    fclose(f);
+    *r_iops = tr;
+    *w_iops = tw;
+    return 0;
+}
+
+static int collect_net_dev(vec_net_t *out) {
+    FILE *f = fopen("/proc/net/dev", "r");
+    if (!f) return -1;
+    char line[512];
+    fgets(line, sizeof(line), f);
+    fgets(line, sizeof(line), f);
+
+    while (fgets(line, sizeof(line), f)) {
+        net_iface_t ni; memset(&ni, 0, sizeof(ni));
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        
+        char *name_start = line;
+        while (isspace(*name_start)) name_start++;
+        strncpy(ni.name, name_start, sizeof(ni.name)-1);
+
+        char *stats = colon + 1;
+        uint64_t rb, rp, re, rd, rf, rfr, rc, rm;
+        uint64_t tb, tp, te, td, tf, tco, tca, tc;
+        
+        if (sscanf(stats, "%llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &rb, &rp, &re, &rd, &rf, &rfr, &rc, &rm,
+                   &tb, &tp, &te, &td, &tf, &tco, &tca, &tc) >= 10) {
+            ni.rx_bytes = rb; ni.rx_packets = rp; ni.rx_errors = re;
+            ni.tx_bytes = tb; ni.tx_packets = tp; ni.tx_errors = te;
+        }
+
+        read_operstate(ni.name, ni.operstate, sizeof(ni.operstate));
+        vec_net_push(out, &ni);
+    }
+    fclose(f);
+    return 0;
+}
+
+static void map_kvm_interfaces(vec_net_t *nets) {
+    DIR *proc = opendir("/proc");
+    if (!proc) return;
+    struct dirent *de;
+    while ((de = readdir(proc)) != NULL) {
+        if (!is_numeric_str(de->d_name)) continue;
+        pid_t pid = atoi(de->d_name);
+        char cmd[CMD_MAX*4];
+        char path[256];
+        snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
+        
+        ssize_t n;
+        if (read_small_file(path, cmd, sizeof(cmd), &n) != 0) continue;
+        
+        for (ssize_t i=0; i<n; i++) if (cmd[i]=='\0') cmd[i]=' ';
+        cmd[n-1]='\0';
+
+        if (strstr(cmd, "kvm") || strstr(cmd, "qemu")) {
+            int vmid = -1;
+            char *id_ptr = strstr(cmd, " -id ");
+            if (id_ptr) sscanf(id_ptr+5, "%d", &vmid);
+
+            char vmname[64] = {0};
+            char *name_ptr = strstr(cmd, " -name ");
+            if (name_ptr) {
+                char *start = name_ptr + 7;
+                char *end = strpbrk(start, " ,");
+                if (end) {
+                    size_t len = (size_t)(end - start);
+                    if (len >= sizeof(vmname)) len = sizeof(vmname)-1;
+                    strncpy(vmname, start, len);
+                } else {
+                    strncpy(vmname, start, sizeof(vmname)-1);
+                }
+            }
+
+            char *net_ptr = cmd;
+            while ((net_ptr = strstr(net_ptr, "ifname=")) != NULL) {
+                char *start = net_ptr + 7;
+                char *end = strpbrk(start, " ,");
+                char ifname[32] = {0};
+                size_t len = end ? (size_t)(end - start) : strlen(start);
+                if (len >= sizeof(ifname)) len = sizeof(ifname)-1;
+                strncpy(ifname, start, len);
+
+                for (size_t i=0; i<nets->len; i++) {
+                    if (strcmp(nets->data[i].name, ifname) == 0) {
+                        nets->data[i].vmid = vmid;
+                        strncpy(nets->data[i].vm_name, vmname, sizeof(nets->data[i].vm_name)-1);
+                    }
+                }
+                if (end) net_ptr = end; else break;
+            }
+        }
+    }
+    closedir(proc);
+}
+
+// ... Process Collection ...
 
 static int pid_in_filter(pid_t pid, const pid_t *filter, size_t n) {
     if (!filter || n == 0) return 1;
@@ -302,7 +459,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
                 s.pid = tid; 
                 s.tgid = pid;
                 s.key = make_key(tid);
-                snprintf(s.cmd, sizeof(s.cmd), "%s", cmd); // Threads share cmdline usually
+                snprintf(s.cmd, sizeof(s.cmd), "%s", cmd); 
 
                 char io_path[PATH_MAX], stat_path[PATH_MAX];
                 snprintf(io_path, sizeof(io_path), "/proc/%d/task/%d/io", pid, tid);
@@ -314,7 +471,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
             }
             closedir(taskdir);
         } else {
-            // Fallback if task dir unreadable (should be rare)
+            // Fallback
             sample_t s; memset(&s, 0, sizeof(s));
             s.pid = pid; 
             s.tgid = pid;
@@ -419,12 +576,11 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
                 dst->data[write_idx].io_wait_ms += dst->data[i].io_wait_ms;
                 dst->data[write_idx].r_mib += dst->data[i].r_mib;
                 dst->data[write_idx].w_mib += dst->data[i].w_mib;
-                // Keep the PID of the TGID (usually the main thread) or just use TGID
                 dst->data[write_idx].pid = dst->data[write_idx].tgid; 
             } else {
                 write_idx++;
                 dst->data[write_idx] = dst->data[i];
-                dst->data[write_idx].pid = dst->data[i].tgid; // Ensure PID column shows TGID
+                dst->data[write_idx].pid = dst->data[i].tgid; 
             }
         }
         dst->len = write_idx + 1;
@@ -437,7 +593,7 @@ static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int cols, int p
         const sample_t *s = &raw->data[i];
         if (s->tgid == tgid && s->pid != tgid) { 
             char pidbuf[32];
-            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); // Indent
+            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); 
             
             printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
                 pidw, pidbuf,
@@ -461,7 +617,8 @@ int main(int argc, char **argv) {
 
     double interval = 5.0; 
     int display_limit = 50;
-    int show_tree = 0; 
+    int show_tree = 0;
+    display_mode_t mode = MODE_PROCESS;
     
     pid_t *filter = NULL;
     size_t filter_n = 0, filter_cap = 0;
@@ -494,6 +651,9 @@ int main(int argc, char **argv) {
     vec_t prev, curr_raw, curr_proc;
     vec_init(&prev); vec_init(&curr_raw); vec_init(&curr_proc);
     
+    vec_net_t prev_net, curr_net;
+    vec_net_init(&prev_net); vec_net_init(&curr_net);
+
     // System Disk Stats
     uint64_t prev_sys_r=0, prev_sys_w=0;
     uint64_t curr_sys_r=0, curr_sys_w=0;
@@ -502,6 +662,8 @@ int main(int argc, char **argv) {
     printf("Initializing (wait %.0fs)...\n", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
+    collect_net_dev(&prev_net);
+
     qsort(prev.data, prev.len, sizeof(sample_t), cmp_key);
     double t_prev = now_monotonic();
 
@@ -510,20 +672,22 @@ int main(int argc, char **argv) {
 
     while (1) {
         vec_free(&curr_raw); vec_init(&curr_raw);
-        if (collect_samples(&curr_raw, filter, filter_n) != 0) break;
+        collect_samples(&curr_raw, filter, filter_n);
         
-        // System Disk Update
+        vec_net_free(&curr_net); vec_net_init(&curr_net);
+        collect_net_dev(&curr_net);
+        map_kvm_interfaces(&curr_net);
+
         read_system_disk_iops(&curr_sys_r, &curr_sys_w);
 
         double t_curr = now_monotonic();
         double dt = t_curr - t_prev;
         if (dt <= 0) dt = interval;
 
-        // System IOPS Calc
         double sys_r_iops = (double)(curr_sys_r - prev_sys_r) / dt;
         double sys_w_iops = (double)(curr_sys_w - prev_sys_w) / dt;
 
-        // 1. Calculate Metrics for ALL threads (Raw)
+        // Process Metrics
         for (size_t i=0; i<curr_raw.len; i++) {
             sample_t *c = &curr_raw.data[i];
             const sample_t *p = find_prev(&prev, c->key);
@@ -544,8 +708,34 @@ int main(int argc, char **argv) {
             c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
         }
 
-        // 2. Aggregate into Process List
-        vec_free(&curr_proc); // Clear old
+        // Net Metrics
+        for (size_t i=0; i<curr_net.len; i++) {
+            net_iface_t *cn = &curr_net.data[i];
+            net_iface_t *pn = NULL;
+            for(size_t j=0; j<prev_net.len; j++) {
+                if (strcmp(prev_net.data[j].name, cn->name) == 0) {
+                    pn = &prev_net.data[j];
+                    break;
+                }
+            }
+            if (pn) {
+                uint64_t dr = (cn->rx_bytes >= pn->rx_bytes) ? cn->rx_bytes - pn->rx_bytes : 0;
+                uint64_t dtb = (cn->tx_bytes >= pn->tx_bytes) ? cn->tx_bytes - pn->tx_bytes : 0;
+                uint64_t dp_r = (cn->rx_packets >= pn->rx_packets) ? cn->rx_packets - pn->rx_packets : 0;
+                uint64_t dp_t = (cn->tx_packets >= pn->tx_packets) ? cn->tx_packets - pn->tx_packets : 0;
+                uint64_t de_r = (cn->rx_errors >= pn->rx_errors) ? cn->rx_errors - pn->rx_errors : 0;
+                uint64_t de_t = (cn->tx_errors >= pn->tx_errors) ? cn->tx_errors - pn->tx_errors : 0;
+
+                cn->rx_mbps = ((double)dr * 8.0) / (dt * 1000000.0);
+                cn->tx_mbps = ((double)dtb * 8.0) / (dt * 1000000.0);
+                cn->rx_pps = (double)dp_r / dt;
+                cn->tx_pps = (double)dp_t / dt;
+                cn->rx_errs_ps = (double)de_r / dt;
+                cn->tx_errs_ps = (double)de_t / dt;
+            }
+        }
+
+        vec_free(&curr_proc); 
         aggregate_by_tgid(&curr_raw, &curr_proc);
 
         int dirty = 1;
@@ -553,100 +743,125 @@ int main(int argc, char **argv) {
 
         while (1) {
             if (dirty) {
-                vec_t *view_list = &curr_proc; 
-
-                switch(sort_col) {
-                    case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid_desc); break;
-                    case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
-                    case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr_desc); break;
-                    case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw_desc); break;
-                    case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait_desc); break;
-                    case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib_desc); break;
-                    case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib_desc); break;
-                    default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
-                }
-
-                printf("\033[2J\033[H"); // Clear screen
+                printf("\033[2J\033[H"); 
                 int cols = get_term_cols();
                 
                 char left[128], right[128];
                 snprintf(left, sizeof(left), "kvmtop %s", KVM_VERSION);
-                snprintf(right, sizeof(right), "Refresh=%.1fs | [t] Tree: %s | [1-7] Sort | [q] Quit", interval, show_tree ? "ON" : "OFF");
+                snprintf(right, sizeof(right), "Refresh=%.1fs | [n] Net | [t] Tree | [1-7] Sort | [q] Quit", interval);
                 
                 int pad = cols - (int)strlen(left) - (int)strlen(right);
                 if (pad < 1) pad = 1;
                 printf("%s%*s%s\n", left, pad, "", right);
 
-                // System Stats Line
                 printf("System IOPS: Read %.0f | Write %.0f\n", sys_r_iops, sys_w_iops);
 
-                int pidw = 14; 
-                int cpuw = 8, iopsw = 10, mibw = 10, waitw=10;
-                int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + waitw+1 + mibw+1 + mibw+1;
-                int cmdw = cols - fixed; if (cmdw < 10) cmdw = 10;
+                if (mode == MODE_NETWORK) {
+                    int namew=16, statw=6, ratew=12, pktw=10, errw=8;
+                    printf("%*s %*s %*s %*s %*s %*s %*s %*s %-6s %s\n",
+                        namew, "IFACE", statw, "STATE", 
+                        ratew, "RX_Mbps", ratew, "TX_Mbps",
+                        pktw, "RX_Pkts", pktw, "TX_Pkts",
+                        errw, "RX_Err", errw, "TX_Err",
+                        "VMID", "VM_NAME");
+                    for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
-                char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
-                snprintf(h_pid, 32, "[1] %s", "PID");
-                snprintf(h_cpu, 32, "[2] %s", "CPU%%");
-                snprintf(h_ri, 32, "[3] %s", "R_Log");
-                snprintf(h_wi, 32, "[4] %s", "W_Log");
-                snprintf(h_wt, 32, "[5] %s", "IO_Wait");
-                snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
-                snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
+                    for(size_t i=0; i<curr_net.len; i++) {
+                        net_iface_t *n = &curr_net.data[i];
+                        if (strcmp(n->name, "lo")==0) continue;
 
-                printf("%*s %*s %*s %*s %*s %*s %*s ",
-                    pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm);
-                fprint_trunc(stdout, "COMMAND", cmdw);
-                putchar('\n');
-                
-                for(int i=0; i<cols; i++) putchar('-');
-                putchar('\n');
+                        char vmid_buf[16] = "-";
+                        if (n->vmid > 0) snprintf(vmid_buf, sizeof(vmid_buf), "%d", n->vmid);
 
-                double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
-                for(size_t i=0; i<curr_raw.len; i++) {
-                    t_cpu += curr_raw.data[i].cpu_pct;
-                    t_ri  += curr_raw.data[i].r_iops;
-                    t_wi  += curr_raw.data[i].w_iops;
-                    t_rm  += curr_raw.data[i].r_mib;
-                    t_wm  += curr_raw.data[i].w_mib;
-                    t_wt  += curr_raw.data[i].io_wait_ms;
-                }
+                        printf("%*s %*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %-6s %s\n",
+                            namew, n->name, statw, n->operstate,
+                            ratew, 2, n->rx_mbps, ratew, 2, n->tx_mbps,
+                            pktw, 0, n->rx_pps, pktw, 0, n->tx_pps,
+                            errw, 0, n->rx_errs_ps, errw, 0, n->tx_errs_ps,
+                            vmid_buf, n->vm_name);
+                    }
+                } else {
+                    vec_t *view_list = &curr_proc; 
 
-                int limit = display_limit; 
-                if ((size_t)limit > view_list->len) limit = view_list->len;
-                
-                for (int i=0; i<limit; i++) {
-                    const sample_t *c = &view_list->data[i];
+                    switch(sort_col) {
+                        case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid_desc); break;
+                        case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
+                        case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr_desc); break;
+                        case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw_desc); break;
+                        case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait_desc); break;
+                        case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib_desc); break;
+                        case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib_desc); break;
+                        default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
+                    }
+
+                    int pidw = 14; 
+                    int cpuw = 8, iopsw = 10, mibw = 10, waitw=10;
+                    int fixed = pidw+1 + cpuw+1 + iopsw+1 + iopsw+1 + waitw+1 + mibw+1 + mibw+1;
+                    int cmdw = cols - fixed; if (cmdw < 10) cmdw = 10;
+
+                    char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
+                    snprintf(h_pid, 32, "[1] %s", "PID");
+                    snprintf(h_cpu, 32, "[2] %s", "CPU%%");
+                    snprintf(h_ri, 32, "[3] %s", "R_Log");
+                    snprintf(h_wi, 32, "[4] %s", "W_Log");
+                    snprintf(h_wt, 32, "[5] %s", "IO_Wait");
+                    snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
+                    snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
+
+                    printf("%*s %*s %*s %*s %*s %*s %*s ",
+                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm);
+                    fprint_trunc(stdout, "COMMAND", cmdw);
+                    putchar('\n');
                     
-                    char pidbuf[32];
-                    snprintf(pidbuf, sizeof(pidbuf), "%d", c->tgid);
-                    
-                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
-                        pidw, pidbuf,
-                        cpuw, 2, c->cpu_pct,
-                        iopsw, 2, c->r_iops,
-                        iopsw, 2, c->w_iops,
-                        waitw, 2, c->io_wait_ms,
-                        mibw, 2, c->r_mib,
-                        mibw, 2, c->w_mib);
-                    fprint_trunc(stdout, c->cmd, cmdw);
+                    for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
 
-                    if (show_tree) {
-                        print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw);
+                    double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
+                    for(size_t i=0; i<curr_raw.len; i++) {
+                        t_cpu += curr_raw.data[i].cpu_pct;
+                        t_ri  += curr_raw.data[i].r_iops;
+                        t_wi  += curr_raw.data[i].w_iops;
+                        t_rm  += curr_raw.data[i].r_mib;
+                        t_wm  += curr_raw.data[i].w_mib;
+                        t_wt  += curr_raw.data[i].io_wait_ms;
                     }
-                }
 
-                for(int i=0; i<cols; i++) putchar('-');
-                putchar('\n');
-                printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
-                        pidw, "TOTAL",
-                        cpuw, 2, t_cpu,
-                        iopsw, 2, t_ri,
-                        iopsw, 2, t_wi,
-                        waitw, 2, t_wt,
-                        mibw, 2, t_rm,
-                        mibw, 2, t_wm);
+                    int limit = display_limit; 
+                    if ((size_t)limit > view_list->len) limit = view_list->len;
+                    
+                    for (int i=0; i<limit; i++) {
+                        const sample_t *c = &view_list->data[i];
+                        
+                        char pidbuf[32];
+                        snprintf(pidbuf, sizeof(pidbuf), "%d", c->tgid);
+                        
+                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
+                            pidw, pidbuf,
+                            cpuw, 2, c->cpu_pct,
+                            iopsw, 2, c->r_iops,
+                            iopsw, 2, c->w_iops,
+                            waitw, 2, c->io_wait_ms,
+                            mibw, 2, c->r_mib,
+                            mibw, 2, c->w_mib);
+                        fprint_trunc(stdout, c->cmd, cmdw);
+                        putchar('\n');
+
+                        if (show_tree) {
+                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw);
+                        }
+                    }
+
+                    for(int i=0; i<cols; i++) putchar('-');
+                    putchar('\n');
+                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
+                            pidw, "TOTAL",
+                            cpuw, 2, t_cpu,
+                            iopsw, 2, t_ri,
+                            iopsw, 2, t_wi,
+                            waitw, 2, t_wt,
+                            mibw, 2, t_rm,
+                            mibw, 2, t_wm);
+                }
                 fflush(stdout);
                 dirty = 0;
             }
@@ -659,6 +874,7 @@ int main(int argc, char **argv) {
             if (c > 0) {
                 if (c == 'q' || c == 'Q') goto cleanup;
                 if (c == 't' || c == 'T') { show_tree = !show_tree; dirty = 1; }
+                if (c == 'n' || c == 'N') { mode = (mode == MODE_NETWORK) ? MODE_PROCESS : MODE_NETWORK; dirty = 1; }
                 if (c == '1' || c == 0x01) { sort_col = SORT_PID; dirty = 1; }
                 if (c == '2' || c == 0x02) { sort_col = SORT_CPU; dirty = 1; }
                 if (c == '3' || c == 0x03) { sort_col = SORT_LOG_R; dirty = 1; }
@@ -672,9 +888,8 @@ int main(int argc, char **argv) {
         }
 
         qsort(curr_raw.data, curr_raw.len, sizeof(sample_t), cmp_key);
-        vec_free(&prev); 
-        prev = curr_raw; 
-        vec_init(&curr_raw); 
+        vec_free(&prev); prev = curr_raw; vec_init(&curr_raw);
+        vec_net_free(&prev_net); prev_net = curr_net; vec_net_init(&curr_net);
         t_prev = t_curr;
         prev_sys_r = curr_sys_r;
         prev_sys_w = curr_sys_w;
@@ -685,6 +900,8 @@ cleanup:
     vec_free(&prev);
     vec_free(&curr_raw);
     vec_free(&curr_proc);
+    vec_net_free(&prev_net);
+    vec_net_free(&curr_net);
     free(filter);
     return 0;
 }
