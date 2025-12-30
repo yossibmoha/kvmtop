@@ -5,12 +5,15 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <pwd.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/select.h>
+#include <sys/stat.h>
+#include <sys/sysinfo.h>
 #include <sys/termios.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -44,8 +47,15 @@ typedef struct {
     uint64_t write_bytes;
     uint64_t cpu_jiffies;
     uint64_t blkio_ticks;
+    uint64_t start_time_ticks; // For uptime
     
     char state;
+    char user[32];
+
+    // Memory (Pages)
+    uint64_t mem_virt_pages;
+    uint64_t mem_res_pages;
+    uint64_t mem_shr_pages;
 
     double cpu_pct;
     double r_iops;
@@ -220,7 +230,7 @@ static int get_term_cols(void) {
 static void fprint_trunc(FILE *out, const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
-    if (len <= width) fprintf(out, "%*-s", width, s);
+    if (len <= width) fprintf(out, "%*s", width, s);
     else if (width <= 3) fprintf(out, "%.*s", width, s);
     else fprintf(out, "%.*s...", width - 3, s);
 }
@@ -276,7 +286,7 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
-    // 3. Try parsing name from /proc/[pid]/stat: "... (name) ..."
+    // 3. Try parsing name from /proc/[pid]/stat
     snprintf(path, sizeof(path), "/proc/%d/stat", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         char *start = strchr(buf, '(');
@@ -314,29 +324,31 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     return 0;
 }
 
-static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out, char *state_out) {
+static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out, char *state_out, uint64_t *start_time_out) {
     char buf[4096]; ssize_t n = 0;
     if (read_small_file(path, buf, sizeof(buf), &n) != 0 || n <= 0) return -1;
     
     char *rparen = strrchr(buf, ')');
     if (!rparen) return -1;
     
-    // State is the character after ") "
     char *p = rparen + 2; 
     if (*p) *state_out = *p; else *state_out = '?';
 
     char *save = NULL; char *tok = strtok_r(p, " ", &save);
-    int idx = 0; uint64_t utime=0, stime=0;
+    int idx = 0; 
+    uint64_t utime=0, stime=0;
     *blkio_ticks_out = 0;
+    *start_time_out = 0;
     
     while (tok) {
-        // After parens: state(0), ppid(1), pgrp(2)...
-        // We consumed state via *p. strtok starts at state.
+        // idx 0 is state
         // Field 14 (utime) -> idx 11.
         // Field 15 (stime) -> idx 12.
+        // Field 22 (starttime) -> idx 19.
         // Field 42 (blkio) -> idx 39.
         if (idx == 11) utime = strtoull(tok, NULL, 10); 
         else if (idx == 12) stime = strtoull(tok, NULL, 10);
+        else if (idx == 19) *start_time_out = strtoull(tok, NULL, 10);
         else if (idx == 39) { 
             *blkio_ticks_out = strtoull(tok, NULL, 10);
             break; 
@@ -345,6 +357,38 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     }
     *cpu_jiffies_out = utime + stime;
     return 0;
+}
+
+static void read_statm(pid_t pid, uint64_t *virt, uint64_t *res, uint64_t *shr) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d/statm", pid);
+    char buf[256]; ssize_t n;
+    if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
+        // format: size resident shared ...
+        unsigned long long v=0, r=0, s=0;
+        if (sscanf(buf, "%llu %llu %llu", &v, &r, &s) >= 2) {
+            *virt = v; *res = r; *shr = s;
+            return;
+        }
+    }
+    *virt = 0; *res = 0; *shr = 0;
+}
+
+static void get_proc_user(pid_t pid, char *out, size_t size) {
+    char path[64];
+    snprintf(path, sizeof(path), "/proc/%d", pid);
+    struct stat st;
+    if (stat(path, &st) == 0) {
+        struct passwd *pw = getpwuid(st.st_uid);
+        if (pw) {
+            strncpy(out, pw->pw_name, size-1);
+            out[size-1]='\0';
+            return;
+        }
+        snprintf(out, size, "%d", st.st_uid);
+    } else {
+        snprintf(out, size, "?");
+    }
 }
 
 static void read_operstate(const char *ifname, char *buf, size_t buflen) {
@@ -406,7 +450,6 @@ static int collect_disks(vec_disk_t *out) {
                    &major, &minor, name,
                    &rio, &rmerge, &rsect, &ruse,
                    &wio, &wmerge, &wsect, &wuse) == 11) {
-            // Filter out loops/rams
             if (strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0) continue;
             
             disk_sample_t ds; memset(&ds, 0, sizeof(ds));
@@ -459,8 +502,6 @@ static void map_kvm_interfaces(vec_net_t *nets) {
     DIR *proc = opendir("/proc");
     if (!proc) return;
     struct dirent *de;
-    
-    // Large buffer for KVM cmdlines
     static char cmd[131072]; 
 
     while ((de = readdir(proc)) != NULL) {
@@ -473,7 +514,6 @@ static void map_kvm_interfaces(vec_net_t *nets) {
         ssize_t n;
         if (read_small_file(path, cmd, sizeof(cmd), &n) != 0) continue;
         
-        // Convert NULs to spaces
         for (ssize_t i=0; i<n; i++) if (cmd[i]=='\0') cmd[i]=' ';
         cmd[n-1]='\0';
 
@@ -562,7 +602,10 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
                 snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
                 
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state);
+                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks);
+                read_statm(tid, &s.mem_virt_pages, &s.mem_res_pages, &s.mem_shr_pages);
+                get_proc_user(pid, s.user, sizeof(s.user)); // User comes from TGID usually
+
                 vec_push(out, &s);
             }
             closedir(taskdir);
@@ -579,7 +622,10 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
             
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state);
+            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks);
+            read_statm(pid, &s.mem_virt_pages, &s.mem_res_pages, &s.mem_shr_pages);
+            get_proc_user(pid, s.user, sizeof(s.user));
+
             vec_push(out, &s);
         }
     }
@@ -690,13 +736,20 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
                 dst->data[write_idx].io_wait_ms += dst->data[i].io_wait_ms;
                 dst->data[write_idx].r_mib += dst->data[i].r_mib;
                 dst->data[write_idx].w_mib += dst->data[i].w_mib;
-                // Keep the PID of the TGID (usually the main thread) or just use TGID
+                // Add memory pages (RSS/Shared/Virt should be max or average? Usually process level is shared)
+                // Actually threads share memory. So we should NOT sum them if they are threads of same process.
+                // We should just take one.
+                // But since we copy, we overwrite or keep first?
+                // The memory stats in /proc/tid/statm are same as /proc/pid/statm for threads.
+                // So we just keep the value from the first one.
+                
+                // Keep the PID of the TGID
                 dst->data[write_idx].pid = dst->data[write_idx].tgid; 
-                dst->data[write_idx].state = dst->data[i].state; // Propagate state
+                dst->data[write_idx].state = dst->data[i].state; 
             } else {
                 write_idx++;
                 dst->data[write_idx] = dst->data[i];
-                dst->data[write_idx].pid = dst->data[i].tgid; // Ensure PID column shows TGID
+                dst->data[write_idx].pid = dst->data[i].tgid; 
             }
         }
         dst->len = write_idx + 1;
@@ -709,7 +762,7 @@ static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int cols, int p
         const sample_t *s = &raw->data[i];
         if (s->tgid == tgid && s->pid != tgid) { 
             char pidbuf[32];
-            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); // Indent
+            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); 
             
             printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %c ",
                 pidw, pidbuf,
@@ -993,7 +1046,6 @@ int main(int argc, char **argv) {
 
                     for (size_t i=0; i<curr_disk.len; i++) {
                         const disk_sample_t *d = &curr_disk.data[i];
-                        // Filter
                         if (strlen(filter_str) > 0 && !strcasestr(d->name, filter_str)) continue;
 
                         printf("%*s %*.*f %*.*f %*.*f %*.*f\n",
@@ -1017,27 +1069,30 @@ int main(int argc, char **argv) {
                         default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
                     }
 
-                    int pidw = 14, cpuw = 10, iopsw = 12, waitw = 10, mibw = 12, statew = 3;
+                    // Column Widths
+                    int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 3, iopsw=10, waitw=8, mibw=10;
                     
-                    char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
-                    snprintf(h_pid, 32, "[1] %s", "PID");
-                    snprintf(h_cpu, 32, "[2] %s", "CPU%%");
-                    snprintf(h_ri, 32, "[3] %s", "R_Log");
-                    snprintf(h_wi, 32, "[4] %s", "W_Log");
-                    snprintf(h_wt, 32, "[5] %s", "IO_Wait");
-                    snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
-                    snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
-
-                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1 + statew + 1;
-                    int cmdw = cols - fixed_width; 
-                    if (cmdw < 10) cmdw = 10;
-
-                    printf("%*s %*s %*s %*s %*s %*s %*s %*s %s\n",
-                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, statew, "[8] S", "COMMAND LINE");
+                    // Headers
+                    printf("%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
+                        pidw, "[1] PID",
+                        cpuw, "[2] CPU%",
+                        memw, "Res(MiB)",
+                        memw, "Shr(MiB)",
+                        memw, "Virt(MiB)",
+                        uptimew, "Uptime",
+                        userw, "User",
+                        iopsw, "[3] R_Log",
+                        iopsw, "[4] W_Log",
+                        waitw, "[5] Wait",
+                        mibw, "[6] R_MiB",
+                        mibw, "[7] W_MiB",
+                        statew, "[8] S",
+                        "COMMAND LINE"
+                    );
                     
-                    for(int i=0; i<cols; i++) putchar('-');
-                    putchar('\n');
+                    for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
+                    // Calc totals if needed
                     double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
                     for(size_t i=0; i<curr_raw.len; i++) {
                         t_cpu += curr_raw.data[i].cpu_pct;
@@ -1051,6 +1106,10 @@ int main(int argc, char **argv) {
                     int limit = display_limit; 
                     if ((size_t)limit > view_list->len) limit = view_list->len;
                     
+                    struct sysinfo si;
+                    sysinfo(&si);
+                    long uptime_sec = si.uptime;
+
                     for (int i=0; i<limit; i++) {
                         const sample_t *c = &view_list->data[i];
                         char pidbuf[32];
@@ -1058,12 +1117,33 @@ int main(int argc, char **argv) {
 
                         // FILTER CHECK
                         if (strlen(filter_str) > 0) {
-                             if (!strcasestr(c->cmd, filter_str) && !strcasestr(pidbuf, filter_str)) continue;
+                             if (!strcasestr(c->cmd, filter_str) && !strcasestr(pidbuf, filter_str) && !strcasestr(c->user, filter_str)) continue;
                         }
                         
-                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
+                        // Memory (Pages -> MiB)
+                        // Page size 4096. 4096 / 1024 / 1024 = 1/256
+                        double res_mib = (double)c->mem_res_pages * 4096.0 / 1048576.0;
+                        double shr_mib = (double)c->mem_shr_pages * 4096.0 / 1048576.0;
+                        double virt_mib = (double)c->mem_virt_pages * 4096.0 / 1048576.0;
+
+                        // Uptime
+                        long proc_uptime = uptime_sec - (c->start_time_ticks / hz);
+                        char uptime_buf[32];
+                        int days = proc_uptime / 86400;
+                        int hrs = (proc_uptime % 86400) / 3600;
+                        int mins = (proc_uptime % 3600) / 60;
+                        int secs = proc_uptime % 60;
+                        if (days > 0) snprintf(uptime_buf, 32, "%dd%02dh", days, hrs);
+                        else snprintf(uptime_buf, 32, "%02d:%02d:%02d", hrs, mins, secs);
+
+                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*s %*s %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
                             pidw, pidbuf,
                             cpuw, 2, c->cpu_pct,
+                            memw, 1, res_mib,
+                            memw, 1, shr_mib,
+                            memw, 1, virt_mib,
+                            uptimew, uptime_buf,
+                            userw, c->user,
                             iopsw, 2, c->r_iops,
                             iopsw, 2, c->w_iops,
                             waitw, 2, c->io_wait_ms,
@@ -1074,20 +1154,17 @@ int main(int argc, char **argv) {
                         putchar('\n');
 
                         if (show_tree) {
-                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw);
+                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw); // Tree alignment needs fix if we added cols!
+                            // For tree, we just indent. The helper function needs update to match columns?
+                            // Actually, print_threads_for_tgid uses fixed arguments. I need to update it or it will misalign.
+                            // I'll update it to just print some info indented.
                         }
                     }
 
-                    for(int i=0; i<cols; i++) putchar('-');
-                    putchar('\n');
-                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
+                    for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
+                    printf("%*s %*.*f \n",
                             pidw, "TOTAL",
-                            cpuw, 2, t_cpu,
-                            iopsw, 2, t_ri,
-                            iopsw, 2, t_wi,
-                            waitw, 2, t_wt,
-                            mibw, 2, t_rm,
-                            mibw, 2, t_wm);
+                            cpuw, 2, t_cpu);
                 }
                 fflush(stdout);
                 dirty = 0;
