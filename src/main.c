@@ -243,7 +243,7 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
         if (out[0] != '\0') return 0;
     }
 
-    snprintf(out, CMD_MAX, "?");
+    snprintf(out, CMD_MAX, "[%d]", pid);
     return -1;
 }
 
@@ -826,89 +826,86 @@ int main(int argc, char **argv) {
                             vmid_buf, n->vm_name);
                         count++;
                     }
-                } else { // MODE_PROCESS
-                    vec_t *view_list = &curr_proc; 
-
-                    switch(sort_col_proc) {
-                        case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid_desc); break;
-                        case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
-                        case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr_desc); break;
-                        case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw_desc); break;
-                        case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait_desc); break;
-                        case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib_desc); break;
-                        case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib_desc); break;
-                        default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
-                    }
-
-                    int pidw = 14; 
-                    int cpuw = 8, iopsw = 10, mibw = 10, waitw=10;
-                    // Fix alignment logic
-                    // Ensure padding matches the headers
-                    
-                    char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
-                    snprintf(h_pid, 32, "[1] %s", "PID");
-                    snprintf(h_cpu, 32, "[2] %s", "CPU%%");
-                    snprintf(h_ri, 32, "[3] %s", "R_Log");
-                    snprintf(h_wi, 32, "[4] %s", "W_Log");
-                    snprintf(h_wt, 32, "[5] %s", "IO_Wait");
-                    snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
-                    snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
-
-                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1;
-                    int cmdw = cols - fixed_width; 
-                    if (cmdw < 10) cmdw = 10;
-
-                    printf("%*s %*s %*s %*s %*s %*s %*s %s\n",
-                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, "COMMAND LINE");
-                    
-                    for(int i=0; i<cols; i++) putchar('-');
-                    putchar('\n');
-
-                    double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
-                    for(size_t i=0; i<curr_raw.len; i++) {
-                        t_cpu += curr_raw.data[i].cpu_pct;
-                        t_ri  += curr_raw.data[i].r_iops;
-                        t_wi  += curr_raw.data[i].w_iops;
-                        t_rm  += curr_raw.data[i].r_mib;
-                        t_wm  += curr_raw.data[i].w_mib;
-                        t_wt  += curr_raw.data[i].io_wait_ms;
-                    }
-
-                    int limit = display_limit; 
-                    if ((size_t)limit > view_list->len) limit = view_list->len;
-                    
-                    for (int i=0; i<limit; i++) {
-                        const sample_t *c = &view_list->data[i];
-                        char pidbuf[32];
-                        snprintf(pidbuf, sizeof(pidbuf), "%d", c->tgid);
-                        
-                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
-                            pidw, pidbuf,
-                            cpuw, 2, c->cpu_pct,
-                            iopsw, 2, c->r_iops,
-                            iopsw, 2, c->w_iops,
-                            waitw, 2, c->io_wait_ms,
-                            mibw, 2, c->r_mib,
-                            mibw, 2, c->w_mib);
-                        fprint_trunc(stdout, c->cmd, cmdw);
-                        putchar('\n');
-
-                        if (show_tree) {
-                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw);
-                        }
-                    }
-
-                    for(int i=0; i<cols; i++) putchar('-');
-                    putchar('\n');
-                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
-                            pidw, "TOTAL",
-                            cpuw, 2, t_cpu,
-                            iopsw, 2, t_ri,
-                            iopsw, 2, t_wi,
-                            waitw, 2, t_wt,
-                            mibw, 2, t_rm,
-                            mibw, 2, t_wm);
-                }
+                                } else { // MODE_PROCESS
+                                    vec_t *view_list = &curr_proc; 
+                
+                                    switch(sort_col_proc) {
+                                        case SORT_PID: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_pid_desc); break;
+                                        case SORT_CPU: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
+                                        case SORT_LOG_R: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logr_desc); break;
+                                        case SORT_LOG_W: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_logw_desc); break;
+                                        case SORT_WAIT: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wait_desc); break;
+                                        case SORT_RMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_rmib_desc); break;
+                                        case SORT_WMIB: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_wmib_desc); break;
+                                        default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
+                                    }
+                
+                                    int pidw = 14, cpuw = 10, iopsw = 12, waitw = 10, mibw = 12;
+                                    
+                                    char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
+                                    snprintf(h_pid, 32, "[1] %s", "PID");
+                                    snprintf(h_cpu, 32, "[2] %s", "CPU%%");
+                                    snprintf(h_ri, 32, "[3] %s", "R_Log");
+                                    snprintf(h_wi, 32, "[4] %s", "W_Log");
+                                    snprintf(h_wt, 32, "[5] %s", "IO_Wait");
+                                    snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
+                                    snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
+                
+                                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1;
+                                    int cmdw = cols - fixed_width; 
+                                    if (cmdw < 10) cmdw = 10;
+                
+                                    printf("%*s %*s %*s %*s %*s %*s %*s %s\n",
+                                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, "COMMAND LINE");
+                                    
+                                    for(int i=0; i<cols; i++) putchar('-');
+                                    putchar('\n');
+                
+                                    double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
+                                    for(size_t i=0; i<curr_raw.len; i++) {
+                                        t_cpu += curr_raw.data[i].cpu_pct;
+                                        t_ri  += curr_raw.data[i].r_iops;
+                                        t_wi  += curr_raw.data[i].w_iops;
+                                        t_rm  += curr_raw.data[i].r_mib;
+                                        t_wm  += curr_raw.data[i].w_mib;
+                                        t_wt  += curr_raw.data[i].io_wait_ms;
+                                    }
+                
+                                    int limit = display_limit; 
+                                    if ((size_t)limit > view_list->len) limit = view_list->len;
+                                    
+                                    for (int i=0; i<limit; i++) {
+                                        const sample_t *c = &view_list->data[i];
+                                        char pidbuf[32];
+                                        snprintf(pidbuf, sizeof(pidbuf), "%d", c->tgid);
+                                        
+                                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
+                                            pidw, pidbuf,
+                                            cpuw, 2, c->cpu_pct,
+                                            iopsw, 2, c->r_iops,
+                                            iopsw, 2, c->w_iops,
+                                            waitw, 2, c->io_wait_ms,
+                                            mibw, 2, c->r_mib,
+                                            mibw, 2, c->w_mib);
+                                        fprint_trunc(stdout, c->cmd, cmdw);
+                                        putchar('\n');
+                
+                                        if (show_tree) {
+                                            print_threads_for_tgid(&curr_raw, c->tgid, cols, pidw, cpuw, iopsw, waitw, mibw, cmdw);
+                                        }
+                                    }
+                
+                                    for(int i=0; i<cols; i++) putchar('-');
+                                    putchar('\n');
+                                    printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f \n",
+                                            pidw, "TOTAL",
+                                            cpuw, 2, t_cpu,
+                                            iopsw, 2, t_ri,
+                                            iopsw, 2, t_wi,
+                                            waitw, 2, t_wt,
+                                            mibw, 2, t_rm,
+                                            mibw, 2, t_wm);
+                                }
                 fflush(stdout);
                 dirty = 0;
             }
