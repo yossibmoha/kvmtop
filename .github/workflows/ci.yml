@@ -21,6 +21,10 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Generate Version Tag
+      id: tag
+      run: echo "VERSION=v$(date +'%Y.%m.%d').${{ github.run_number }}" >> $GITHUB_ENV
+
     - name: Build
       run: |
         make VERSION=${{ env.VERSION }}
