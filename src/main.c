@@ -28,7 +28,8 @@
 typedef enum {
     MODE_PROCESS = 0,
     MODE_TREE,
-    MODE_NETWORK
+    MODE_NETWORK,
+    MODE_STORAGE
 } display_mode_t;
 
 // --- Data Structures ---
@@ -43,6 +44,8 @@ typedef struct {
     uint64_t write_bytes;
     uint64_t cpu_jiffies;
     uint64_t blkio_ticks;
+    
+    char state;
 
     double cpu_pct;
     double r_iops;
@@ -55,10 +58,29 @@ typedef struct {
 } sample_t;
 
 typedef struct {
+    char name[32];
+    unsigned long long rio;
+    unsigned long long wio;
+    unsigned long long rsect;
+    unsigned long long wsect;
+    
+    double r_iops;
+    double w_iops;
+    double r_mib;
+    double w_mib;
+} disk_sample_t;
+
+typedef struct {
     sample_t *data;
     size_t len;
     size_t cap;
 } vec_t;
+
+typedef struct {
+    disk_sample_t *data;
+    size_t len;
+    size_t cap;
+} vec_disk_t;
 
 typedef struct {
     char name[32];
@@ -96,6 +118,19 @@ static void vec_push(vec_t *v, const sample_t *item) {
     if (v->len == v->cap) {
         size_t new_cap = v->cap ? v->cap * 2 : 4096;
         sample_t *p = (sample_t *)realloc(v->data, new_cap * sizeof(*p));
+        if (!p) { fprintf(stderr, "OOM\n"); exit(2); }
+        v->data = p;
+        v->cap = new_cap;
+    }
+    v->data[v->len++] = *item;
+}
+
+static void vec_disk_init(vec_disk_t *v) { v->data=NULL; v->len=0; v->cap=0; }
+static void vec_disk_free(vec_disk_t *v) { free(v->data); v->data=NULL; v->len=0; v->cap=0; }
+static void vec_disk_push(vec_disk_t *v, const disk_sample_t *item) {
+    if (v->len == v->cap) {
+        size_t new_cap = v->cap ? v->cap * 2 : 64;
+        disk_sample_t *p = (disk_sample_t *)realloc(v->data, new_cap * sizeof(*p));
         if (!p) { fprintf(stderr, "OOM\n"); exit(2); }
         v->data = p;
         v->cap = new_cap;
@@ -227,19 +262,32 @@ static int read_cmdline(pid_t pid, char out[CMD_MAX]) {
     char path[PATH_MAX], buf[8192];
     ssize_t n = 0;
     
-    // Try /proc/[pid]/cmdline first
+    // 1. Try /proc/[pid]/cmdline
     snprintf(path, sizeof(path), "/proc/%d/cmdline", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         sanitize_cmd(out, buf, (size_t)n);
         if (out[0] != '\0' && out[0] != ' ') return 0;
     }
 
-    // Fallback to /proc/[pid]/comm
+    // 2. Try /proc/[pid]/comm
     snprintf(path, sizeof(path), "/proc/%d/comm", pid);
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
-        // Comm usually has a newline at the end, sanitize handles it
         sanitize_cmd(out, buf, (size_t)n); 
         if (out[0] != '\0' && out[0] != ' ') return 0;
+    }
+
+    // 3. Try parsing name from /proc/[pid]/stat: "... (name) ..."
+    snprintf(path, sizeof(path), "/proc/%d/stat", pid);
+    if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
+        char *start = strchr(buf, '(');
+        char *end = strrchr(buf, ')');
+        if (start && end && end > start) {
+            size_t len = (size_t)(end - start - 1);
+            if (len >= CMD_MAX) len = CMD_MAX - 1;
+            strncpy(out, start + 1, len);
+            out[len] = '\0';
+            return 0;
+        }
     }
 
     snprintf(out, CMD_MAX, "[%d]", pid);
@@ -266,20 +314,30 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     return 0;
 }
 
-static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out) {
+static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out, char *state_out) {
     char buf[4096]; ssize_t n = 0;
     if (read_small_file(path, buf, sizeof(buf), &n) != 0 || n <= 0) return -1;
+    
     char *rparen = strrchr(buf, ')');
     if (!rparen) return -1;
+    
+    // State is the character after ") "
     char *p = rparen + 2; 
+    if (*p) *state_out = *p; else *state_out = '?';
+
     char *save = NULL; char *tok = strtok_r(p, " ", &save);
     int idx = 0; uint64_t utime=0, stime=0;
     *blkio_ticks_out = 0;
     
     while (tok) {
-        if (idx == 11) utime = strtoull(tok, NULL, 10);
+        // After parens: state(0), ppid(1), pgrp(2)...
+        // We consumed state via *p. strtok starts at state.
+        // Field 14 (utime) -> idx 11.
+        // Field 15 (stime) -> idx 12.
+        // Field 42 (blkio) -> idx 39.
+        if (idx == 11) utime = strtoull(tok, NULL, 10); 
         else if (idx == 12) stime = strtoull(tok, NULL, 10);
-        else if (idx == 39) { // Field 42
+        else if (idx == 39) { 
             *blkio_ticks_out = strtoull(tok, NULL, 10);
             break; 
         }
@@ -332,6 +390,33 @@ static int read_system_disk_iops(uint64_t *r_iops, uint64_t *w_iops) {
     fclose(f);
     *r_iops = tr;
     *w_iops = tw;
+    return 0;
+}
+
+static int collect_disks(vec_disk_t *out) {
+    FILE *f = fopen("/proc/diskstats", "r");
+    if (!f) return -1;
+    char line[512];
+    while (fgets(line, sizeof(line), f)) {
+        int major, minor;
+        char name[64];
+        unsigned long long rio, rmerge, rsect, ruse;
+        unsigned long long wio, wmerge, wsect, wuse;
+        if (sscanf(line, "%d %d %s %llu %llu %llu %llu %llu %llu %llu %llu",
+                   &major, &minor, name,
+                   &rio, &rmerge, &rsect, &ruse,
+                   &wio, &wmerge, &wsect, &wuse) == 11) {
+            // Filter out loops/rams
+            if (strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0) continue;
+            
+            disk_sample_t ds; memset(&ds, 0, sizeof(ds));
+            strncpy(ds.name, name, sizeof(ds.name)-1);
+            ds.rio = rio; ds.wio = wio;
+            ds.rsect = rsect; ds.wsect = wsect;
+            vec_disk_push(out, &ds);
+        }
+    }
+    fclose(f);
     return 0;
 }
 
@@ -477,7 +562,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
                 snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
                 
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks);
+                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state);
                 vec_push(out, &s);
             }
             closedir(taskdir);
@@ -494,7 +579,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
             
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks);
+            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state);
             vec_push(out, &s);
         }
     }
@@ -571,6 +656,11 @@ static int cmp_net_tx_desc(const void *a, const void *b) {
     const net_iface_t *y = (const net_iface_t *)b;
     return (x->tx_mbps < y->tx_mbps) - (x->tx_mbps > y->tx_mbps);
 }
+static int cmp_disk_rio_desc(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return (x->r_iops < y->r_iops) - (x->r_iops > y->r_iops);
+}
 
 // Aggregate threads into process-level stats
 static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
@@ -602,6 +692,7 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
                 dst->data[write_idx].w_mib += dst->data[i].w_mib;
                 // Keep the PID of the TGID (usually the main thread) or just use TGID
                 dst->data[write_idx].pid = dst->data[write_idx].tgid; 
+                dst->data[write_idx].state = dst->data[i].state; // Propagate state
             } else {
                 write_idx++;
                 dst->data[write_idx] = dst->data[i];
@@ -620,14 +711,15 @@ static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int cols, int p
             char pidbuf[32];
             snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); // Indent
             
-            printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
+            printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %c ",
                 pidw, pidbuf,
                 cpuw, 2, s->cpu_pct,
                 iopsw, 2, s->r_iops,
                 iopsw, 2, s->w_iops,
                 waitw, 2, s->io_wait_ms,
                 mibw, 2, s->r_mib,
-                mibw, 2, s->w_mib);
+                mibw, 2, s->w_mib,
+                s->state);
             fprint_trunc(stdout, s->cmd, cmdw);
             putchar('\n');
         }
@@ -686,6 +778,9 @@ int main(int argc, char **argv) {
     vec_net_t prev_net, curr_net;
     vec_net_init(&prev_net); vec_net_init(&curr_net);
 
+    vec_disk_t prev_disk, curr_disk;
+    vec_disk_init(&prev_disk); vec_disk_init(&curr_disk);
+
     // System Disk Stats
     uint64_t prev_sys_r=0, prev_sys_w=0;
     uint64_t curr_sys_r=0, curr_sys_w=0;
@@ -695,6 +790,7 @@ int main(int argc, char **argv) {
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
+    collect_disks(&prev_disk);
 
     qsort(prev.data, prev.len, sizeof(sample_t), cmp_key);
     double t_prev = now_monotonic();
@@ -715,6 +811,9 @@ int main(int argc, char **argv) {
             vec_net_free(&curr_net); vec_net_init(&curr_net);
             collect_net_dev(&curr_net);
             map_kvm_interfaces(&curr_net);
+
+            vec_disk_free(&curr_disk); vec_disk_init(&curr_disk);
+            collect_disks(&curr_disk);
 
             read_system_disk_iops(&curr_sys_r, &curr_sys_w);
 
@@ -773,6 +872,29 @@ int main(int argc, char **argv) {
                 }
             }
 
+            // Disk Metrics
+            for (size_t i=0; i<curr_disk.len; i++) {
+                disk_sample_t *cd = &curr_disk.data[i];
+                disk_sample_t *pd = NULL;
+                for(size_t j=0; j<prev_disk.len; j++) {
+                    if (strcmp(prev_disk.data[j].name, cd->name) == 0) {
+                        pd = &prev_disk.data[j];
+                        break;
+                    }
+                }
+                if (pd) {
+                    uint64_t drio = (cd->rio >= pd->rio) ? cd->rio - pd->rio : 0;
+                    uint64_t dwio = (cd->wio >= pd->wio) ? cd->wio - pd->wio : 0;
+                    uint64_t drs  = (cd->rsect >= pd->rsect) ? cd->rsect - pd->rsect : 0;
+                    uint64_t dws  = (cd->wsect >= pd->wsect) ? cd->wsect - pd->wsect : 0;
+                    
+                    cd->r_iops = (double)drio / dt;
+                    cd->w_iops = (double)dwio / dt;
+                    cd->r_mib  = ((double)drs * 512.0) / (dt * 1048576.0);
+                    cd->w_mib  = ((double)dws * 512.0) / (dt * 1048576.0);
+                }
+            }
+
             vec_free(&curr_proc); 
             aggregate_by_tgid(&curr_raw, &curr_proc);
             
@@ -801,7 +923,7 @@ int main(int argc, char **argv) {
                     char f_info[40] = "";
                     if (strlen(filter_str) > 0) snprintf(f_info, sizeof(f_info), "Filter: %s | ", filter_str);
                     
-                    snprintf(right, sizeof(right), "%sRefresh=%.1fs | [c] CPU/Disk | [n] Net | [t] Tree | [l] Limit(%d) | [f] Freeze: %s | [/] Filter | [q] Quit", 
+                    snprintf(right, sizeof(right), "%sRefresh=%.1fs | [c] CPU | [s] Storage | [n] Net | [t] Tree | [l] Limit(%d) | [f] Freeze: %s | [/] Filter | [q] Quit", 
                              f_info, interval, display_limit, frozen ? "ON" : "OFF");
                 }
                 
@@ -854,6 +976,33 @@ int main(int argc, char **argv) {
                             vmid_buf, n->vm_name);
                         count++;
                     }
+                } else if (mode == MODE_STORAGE) {
+                    qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio_desc); 
+
+                    int devw=16, iopsw=12, mibw=12;
+                    char h_ri[32], h_wi[32], h_rm[32], h_wm[32];
+                    snprintf(h_ri, 32, "R_IOPS");
+                    snprintf(h_wi, 32, "W_IOPS");
+                    snprintf(h_rm, 32, "R_MiB/s");
+                    snprintf(h_wm, 32, "W_MiB/s");
+
+                    printf("%*s %*s %*s %*s %*s\n",
+                        devw, "DEVICE", iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm);
+                    
+                    for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
+
+                    for (size_t i=0; i<curr_disk.len; i++) {
+                        const disk_sample_t *d = &curr_disk.data[i];
+                        // Filter
+                        if (strlen(filter_str) > 0 && !strcasestr(d->name, filter_str)) continue;
+
+                        printf("%*s %*.*f %*.*f %*.*f %*.*f\n",
+                            devw, d->name,
+                            iopsw, 2, d->r_iops,
+                            iopsw, 2, d->w_iops,
+                            mibw, 2, d->r_mib,
+                            mibw, 2, d->w_mib);
+                    }
                 } else { // MODE_PROCESS
                     vec_t *view_list = &curr_proc; 
 
@@ -868,7 +1017,7 @@ int main(int argc, char **argv) {
                         default: qsort(view_list->data, view_list->len, sizeof(sample_t), cmp_cpu_desc); break;
                     }
 
-                    int pidw = 14, cpuw = 10, iopsw = 12, waitw = 10, mibw = 12;
+                    int pidw = 14, cpuw = 10, iopsw = 12, waitw = 10, mibw = 12, statew = 3;
                     
                     char h_pid[32], h_cpu[32], h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_wt[32];
                     snprintf(h_pid, 32, "[1] %s", "PID");
@@ -879,12 +1028,12 @@ int main(int argc, char **argv) {
                     snprintf(h_rm, 32, "[6] %s", "R_MiB/s");
                     snprintf(h_wm, 32, "[7] %s", "W_MiB/s");
 
-                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1;
+                    int fixed_width = pidw + 1 + cpuw + 1 + iopsw + 1 + iopsw + 1 + waitw + 1 + mibw + 1 + mibw + 1 + statew + 1;
                     int cmdw = cols - fixed_width; 
                     if (cmdw < 10) cmdw = 10;
 
-                    printf("%*s %*s %*s %*s %*s %*s %*s %s\n",
-                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, "COMMAND LINE");
+                    printf("%*s %*s %*s %*s %*s %*s %*s %*s %s\n",
+                        pidw, h_pid, cpuw, h_cpu, iopsw, h_ri, iopsw, h_wi, waitw, h_wt, mibw, h_rm, mibw, h_wm, statew, "[8] S", "COMMAND LINE");
                     
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
@@ -912,14 +1061,15 @@ int main(int argc, char **argv) {
                              if (!strcasestr(c->cmd, filter_str) && !strcasestr(pidbuf, filter_str)) continue;
                         }
                         
-                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f ",
+                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
                             pidw, pidbuf,
                             cpuw, 2, c->cpu_pct,
                             iopsw, 2, c->r_iops,
                             iopsw, 2, c->w_iops,
                             waitw, 2, c->io_wait_ms,
                             mibw, 2, c->r_mib,
-                            mibw, 2, c->w_mib);
+                            mibw, 2, c->w_mib,
+                            statew, c->state);
                         fprint_trunc(stdout, c->cmd, cmdw);
                         putchar('\n');
 
@@ -1002,6 +1152,7 @@ int main(int argc, char **argv) {
                     if (c == 't' || c == 'T') { show_tree = !show_tree; mode = MODE_PROCESS; dirty = 1; }
                     if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
                     if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
+                    if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
                     
                     if (mode == MODE_PROCESS) {
                         if (c == '1' || c == 0x01) { sort_col_proc = SORT_PID; dirty = 1; }
@@ -1023,6 +1174,8 @@ int main(int argc, char **argv) {
             qsort(curr_raw.data, curr_raw.len, sizeof(sample_t), cmp_key);
             vec_free(&prev); prev = curr_raw; vec_init(&curr_raw);
             vec_net_free(&prev_net); prev_net = curr_net; vec_net_init(&curr_net);
+            vec_disk_free(&prev_disk); prev_disk = curr_disk; vec_disk_init(&curr_disk);
+            t_prev = t_curr;
             prev_sys_r = curr_sys_r;
             prev_sys_w = curr_sys_w;
         }
@@ -1035,6 +1188,8 @@ cleanup:
     vec_free(&curr_proc);
     vec_net_free(&prev_net);
     vec_net_free(&curr_net);
+    vec_disk_free(&prev_disk);
+    vec_disk_free(&curr_disk);
     free(filter);
     return 0;
 }
