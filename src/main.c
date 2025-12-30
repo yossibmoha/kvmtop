@@ -691,8 +691,7 @@ int main(int argc, char **argv) {
     uint64_t curr_sys_r=0, curr_sys_w=0;
     read_system_disk_iops(&prev_sys_r, &prev_sys_w);
 
-    printf("Initializing (wait %.0fs)...
-", interval);
+    printf("Initializing (wait %.0fs)...\n", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
