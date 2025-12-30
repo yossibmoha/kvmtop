@@ -1,5 +1,5 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2
+CFLAGS = -Wall -Wextra -O2 -static
 TARGET = kvmtop
 SRC_DIR = src
 BUILD_DIR = build
