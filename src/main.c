@@ -123,6 +123,17 @@ typedef struct {
     size_t cap;
 } vec_net_t;
 
+typedef struct {
+    unsigned long long user;
+    unsigned long long nice;
+    unsigned long long system;
+    unsigned long long idle;
+    unsigned long long iowait;
+    unsigned long long irq;
+    unsigned long long softirq;
+    unsigned long long steal;
+} global_cpu_t;
+
 // --- Helper Functions ---
 
 static void vec_init(vec_t *v) { v->data=NULL; v->len=0; v->cap=0; }
@@ -235,7 +246,7 @@ static int get_term_cols(void) {
 static void fprint_trunc(FILE *out, const char *s, int width) {
     if (width <= 0) return;
     int len = (int)strlen(s);
-    if (len <= width) fprintf(out, "%-*s", width, s);
+    if (len <= width) fprintf(out, "%*s", width, s);
     else if (width <= 3) fprintf(out, "%.*s", width, s);
     else fprintf(out, "%.*s...", width - 3, s);
 }
@@ -431,6 +442,38 @@ static int read_system_disk_iops(uint64_t *r_iops, uint64_t *w_iops) {
     *r_iops = tr;
     *w_iops = tw;
     return 0;
+}
+
+static int read_global_cpu(global_cpu_t *cpu) {
+    FILE *f = fopen("/proc/stat", "r");
+    if (!f) return -1;
+    char line[512];
+    if (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, "cpu ", 4) == 0) {
+            sscanf(line + 4, "%llu %llu %llu %llu %llu %llu %llu %llu",
+                &cpu->user, &cpu->nice, &cpu->system, &cpu->idle,
+                &cpu->iowait, &cpu->irq, &cpu->softirq, &cpu->steal);
+        }
+    }
+    fclose(f);
+    return 0;
+}
+
+static int read_loadavg_threads(void) {
+    FILE *f = fopen("/proc/loadavg", "r");
+    if (!f) return 0;
+    char line[256];
+    int threads = 0;
+    if (fgets(line, sizeof(line), f)) {
+        char *slash = strchr(line, '/');
+        if (slash) {
+            // "1/845" -> slash points to /
+            // The number after slash is total threads
+            threads = atoi(slash + 1);
+        }
+    }
+    fclose(f);
+    return threads;
 }
 
 static int collect_disks(vec_disk_t *out) {
@@ -789,11 +832,11 @@ static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int c
             char pidbuf[32];
             snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); // Indent
             
-            printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %c ",
+            printf("%*s %*.*f %*.0f %*.0f %*.*f %*.*f %*.*f   %c   ",
                 pidw, pidbuf,
                 cpuw, 2, s->cpu_pct,
-                iopsw, 2, s->r_iops,
-                iopsw, 2, s->w_iops,
+                iopsw, s->r_iops,
+                iopsw, s->w_iops,
                 waitw, 2, s->io_wait_ms,
                 mibw, 2, s->r_mib,
                 mibw, 2, s->w_mib,
@@ -862,12 +905,14 @@ int main(int argc, char **argv) {
     vec_disk_t prev_disk, curr_disk;
     vec_disk_init(&prev_disk); vec_disk_init(&curr_disk);
 
-    // System Disk Stats
-    uint64_t prev_sys_r=0, prev_sys_w=0;
-    uint64_t curr_sys_r=0, curr_sys_w=0;
-    read_system_disk_iops(&prev_sys_r, &prev_sys_w);
+    // Global CPU Stats
+    global_cpu_t prev_cpu, curr_cpu;
+    memset(&prev_cpu, 0, sizeof(prev_cpu));
+    memset(&curr_cpu, 0, sizeof(curr_cpu));
+    read_global_cpu(&prev_cpu);
 
-    printf("Initializing (wait %.0fs)...\n", interval);
+    printf("Initializing (wait %.0fs)...
+", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
@@ -876,7 +921,8 @@ int main(int argc, char **argv) {
     qsort(prev.data, prev.len, sizeof(sample_t), cmp_key);
     double t_prev = now_monotonic();
     
-    double sys_r_iops = 0, sys_w_iops = 0;
+    double global_cpu_percent = 0.0;
+    int system_threads = 0;
 
     enable_raw_mode();
     sort_col_t sort_col_proc = SORT_CPU;
@@ -897,14 +943,23 @@ int main(int argc, char **argv) {
             vec_disk_free(&curr_disk); vec_disk_init(&curr_disk);
             collect_disks(&curr_disk);
 
-            read_system_disk_iops(&curr_sys_r, &curr_sys_w);
+            read_global_cpu(&curr_cpu);
+            system_threads = read_loadavg_threads();
 
             t_curr = now_monotonic();
             double dt = t_curr - t_prev;
             if (dt <= 0) dt = interval;
 
-            sys_r_iops = (double)(curr_sys_r - prev_sys_r) / dt;
-            sys_w_iops = (double)(curr_sys_w - prev_sys_w) / dt;
+            // Global CPU Calc
+            unsigned long long prev_total = prev_cpu.user + prev_cpu.nice + prev_cpu.system + prev_cpu.idle + prev_cpu.iowait + prev_cpu.irq + prev_cpu.softirq + prev_cpu.steal;
+            unsigned long long curr_total = curr_cpu.user + curr_cpu.nice + curr_cpu.system + curr_cpu.idle + curr_cpu.iowait + curr_cpu.irq + curr_cpu.softirq + curr_cpu.steal;
+            unsigned long long total_diff = curr_total - prev_total;
+            unsigned long long idle_diff = curr_cpu.idle - prev_cpu.idle;
+            if (total_diff > 0) {
+                global_cpu_percent = 100.0 * (double)(total_diff - idle_diff) / (double)total_diff;
+            } else {
+                global_cpu_percent = 0.0;
+            }
 
             // Process Metrics
             for (size_t i=0; i<curr_raw.len; i++) {
@@ -986,8 +1041,7 @@ int main(int argc, char **argv) {
             aggregate_by_tgid(&curr_raw, &curr_proc);
             
             t_prev = t_curr;
-            prev_sys_r = curr_sys_r;
-            prev_sys_w = curr_sys_w;
+            prev_cpu = curr_cpu;
         }
 
         int dirty = 1;
@@ -1020,7 +1074,17 @@ int main(int argc, char **argv) {
                 if (pad < 1) pad = 1;
                 printf("%s%*s%s\n", left, pad, "", right);
 
-                printf("System IOPS: Read %.0f | Write %.0f\n", sys_r_iops, sys_w_iops);
+                struct sysinfo si;
+                sysinfo(&si);
+                double total_ram = (double)si.totalram * si.mem_unit / 1048576.0;
+                double used_ram = total_ram - ((double)si.freeram * si.mem_unit / 1048576.0) - ((double)si.bufferram * si.mem_unit / 1048576.0);
+                double total_swap = (double)si.totalswap * si.mem_unit / 1048576.0;
+                double used_swap = total_swap - ((double)si.freeswap * si.mem_unit / 1048576.0);
+                
+                printf("CPU: %5.2f%% (%d Threads) | RAM: %.0f / %.0f MiB (%.1f%%) | SWAP: %.0f / %.0f MiB (%.1f%%)\n",
+                    global_cpu_percent, system_threads,
+                    used_ram, total_ram, (total_ram > 0) ? (used_ram / total_ram * 100.0) : 0.0,
+                    used_swap, total_swap, (total_swap > 0) ? (used_swap / total_swap * 100.0) : 0.0);
 
                 if (mode == MODE_NETWORK) {
                     if (sort_col_net == SORT_NET_RX) 
@@ -1119,7 +1183,7 @@ int main(int argc, char **argv) {
                     }
 
                     // Column Widths
-                    int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 3, iopsw=10, waitw=8, mibw=10;
+                    int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 5, iopsw=10, waitw=8, mibw=10;
                     
                     // Headers
                     int fixed_width = pidw + 1 + cpuw + 1 + 
@@ -1133,7 +1197,7 @@ int main(int argc, char **argv) {
                     int cmdw = cols - fixed_width; 
                     if (cmdw < 10) cmdw = 10;
 
-                    printf("%*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
+                    printf("%*s %-*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
                         pidw, "[1] PID",
                         userw, "User",
                         uptimew, "Uptime",
@@ -1199,20 +1263,20 @@ int main(int argc, char **argv) {
                         if (days > 0) snprintf(uptime_buf, 32, "%dd%02dh", days, hrs);
                         else snprintf(uptime_buf, 32, "%02d:%02d:%02d", hrs, mins, secs);
 
-                        printf("%*s %*s %*s %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
+                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f   %c   ",
                             pidw, pidbuf,
                             userw, c->user,
                             uptimew, uptime_buf,
                             memw, res_mib,
                             memw, shr_mib,
                             memw, virt_mib,
-                            iopsw, 2, c->r_iops,
-                            iopsw, 2, c->w_iops,
+                            iopsw, c->r_iops,
+                            iopsw, c->w_iops,
                             waitw, 2, c->io_wait_ms,
                             mibw, 0, c->r_mib,
                             mibw, 0, c->w_mib,
                             cpuw, 2, c->cpu_pct,
-                            statew, c->state);
+                            c->state);
                         fprint_trunc(stdout, c->cmd, cmdw);
                         putchar('\n');
 
@@ -1223,15 +1287,15 @@ int main(int argc, char **argv) {
 
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
-                    printf("%*s %*s %*s %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f\n",
+                    printf("%*s %*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f\n",
                             pidw, "TOTAL",
                             userw, "",
                             uptimew, "",
                             memw, t_res,
                             memw, t_shr,
                             memw, t_virt,
-                            iopsw, 2, t_ri,
-                            iopsw, 2, t_wi,
+                            iopsw, t_ri,
+                            iopsw, t_wi,
                             waitw, 2, t_wt,
                             mibw, 0, t_rm,
                             mibw, 0, t_wm,
@@ -1364,8 +1428,7 @@ int main(int argc, char **argv) {
             vec_net_free(&prev_net); prev_net = curr_net; vec_net_init(&curr_net);
             vec_disk_free(&prev_disk); prev_disk = curr_disk; vec_disk_init(&curr_disk);
             t_prev = t_curr;
-            prev_sys_r = curr_sys_r;
-            prev_sys_w = curr_sys_w;
+            prev_cpu = curr_cpu;
         }
     }
 
