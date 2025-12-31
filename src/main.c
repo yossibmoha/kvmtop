@@ -822,7 +822,7 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
 }
 
 // Tree view helper
-static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int cpuw, int iopsw, int waitw, int mibw, int cmdw) {
+static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int cpuw, int iopsw, int waitw, int mibw, int statew, int cmdw) {
     for (size_t i = 0; i < raw->len; i++) {
         const sample_t *s = &raw->data[i];
         if (s->tgid == tgid && s->pid != tgid) { 
@@ -1284,7 +1284,7 @@ int main(int argc, char **argv) {
                         putchar('\n');
 
                         if (show_tree) {
-                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, iopsw, waitw, mibw, cmdw);
+                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, iopsw, waitw, mibw, statew, cmdw);
                         }
                     }
 
