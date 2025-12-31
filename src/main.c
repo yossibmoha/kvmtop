@@ -204,6 +204,7 @@ static void enable_raw_mode() {
 }
 
 static int wait_for_input(double seconds) {
+    if (seconds < 0) seconds = 0;
     struct timeval tv;
     tv.tv_sec = (long)seconds;
     tv.tv_usec = (long)((seconds - (double)tv.tv_sec) * 1e6);
@@ -214,11 +215,12 @@ static int wait_for_input(double seconds) {
     FD_SET(STDIN_FILENO, &fds);
 
     int ret = select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv);
+    
     if (ret > 0) {
         unsigned char c;
         if (read(STDIN_FILENO, &c, 1) == 1) return c;
     }
-    return 0; // Timeout
+    return 0; // Timeout or error
 }
 
 static int get_term_cols(void) {
@@ -1234,6 +1236,124 @@ int main(int argc, char **argv) {
                             mibw, 0, t_rm,
                             mibw, 0, t_wm,
                             cpuw, 2, t_cpu);
+                }
+                fflush(stdout);
+                dirty = 0;
+            }
+
+            double elapsed = now_monotonic() - start_wait;
+            double remain = interval - elapsed;
+            if (remain <= 0) break;
+
+            int c = wait_for_input(remain);
+            // Prevent busy loop if select returns 0 immediately but remain is still large
+            if (c == 0 && remain > 0.1) {
+                usleep(50000); // 50ms sleep to be safe
+            }
+
+            if (c > 0) {
+                if (in_filter_mode) {
+                    if (c == 27) { // ESC
+                        in_filter_mode = 0;
+                        filter_str[0] = '\0';
+                        dirty = 1;
+                    } else if (c == 127 || c == 8) { // Backspace
+                        size_t len = strlen(filter_str);
+                        if (len > 0) filter_str[len-1] = '\0';
+                        dirty = 1;
+                    } else if (c == '\n' || c == '\r') {
+                        in_filter_mode = 0;
+                        dirty = 1;
+                    } else if (isprint(c)) {
+                        size_t len = strlen(filter_str);
+                        if (len < sizeof(filter_str)-1) {
+                            filter_str[len] = (char)c;
+                            filter_str[len+1] = '\0';
+                        }
+                        dirty = 1;
+                    }
+                } else if (in_limit_mode) {
+                    if (c == 27) { // ESC
+                        in_limit_mode = 0;
+                        limit_str[0] = '\0';
+                        dirty = 1;
+                    } else if (c == 127 || c == 8) {
+                        size_t len = strlen(limit_str);
+                        if (len > 0) limit_str[len-1] = '\0';
+                        dirty = 1;
+                    } else if (c == '\n' || c == '\r') {
+                        if (strlen(limit_str) > 0) {
+                            int val = atoi(limit_str);
+                            if (val > 0) display_limit = val;
+                        }
+                        in_limit_mode = 0;
+                        limit_str[0] = '\0';
+                        dirty = 1;
+                    } else if (isdigit(c)) {
+                        size_t len = strlen(limit_str);
+                        if (len < sizeof(limit_str)-1) {
+                            limit_str[len] = (char)c;
+                            limit_str[len+1] = '\0';
+                        }
+                        dirty = 1;
+                    }
+                } else if (in_refresh_mode) {
+                    if (c == 27) { 
+                        in_refresh_mode = 0;
+                        refresh_str[0] = '\0';
+                        dirty = 1;
+                    } else if (c == 127 || c == 8) {
+                        size_t len = strlen(refresh_str);
+                        if (len > 0) refresh_str[len-1] = '\0';
+                        dirty = 1;
+                    } else if (c == '\n' || c == '\r') {
+                        if (strlen(refresh_str) > 0) {
+                            double val = strtod(refresh_str, NULL);
+                            if (val >= 0.1) interval = val;
+                        }
+                        in_refresh_mode = 0;
+                        refresh_str[0] = '\0';
+                        dirty = 1;
+                    } else if (isdigit(c) || c == '.') {
+                        size_t len = strlen(refresh_str);
+                        if (len < sizeof(refresh_str)-1) {
+                            refresh_str[len] = (char)c;
+                            refresh_str[len+1] = '\0';
+                        }
+                        dirty = 1;
+                    }
+                } else {
+                    if (c == '/') { in_filter_mode = 1; dirty = 1; }
+                    if (c == 'l' || c == 'L') { in_limit_mode = 1; limit_str[0]='\0'; dirty = 1; }
+                    if (c == 'r' || c == 'R') { in_refresh_mode = 1; refresh_str[0]='\0'; dirty = 1; }
+                    if (c == 'q' || c == 'Q') goto cleanup;
+                    if (c == 'f' || c == 'F') { frozen = !frozen; dirty = 1; }
+                    if (c == 't' || c == 'T') { show_tree = !show_tree; mode = MODE_PROCESS; dirty = 1; }
+                    if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
+                    if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
+                    if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
+                    
+                    if (mode == MODE_PROCESS) {
+                        if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == 0x02) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
+                        if (c == '3' || c == 0x03) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
+                        if (c == '4' || c == 0x04) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
+                        if (c == '5' || c == 0x05) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
+                        if (c == '6' || c == 0x06) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '7' || c == 0x07) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
+                    } else { // MODE_NETWORK
+                        if (c == '1' || c == 0x01) { sort_col_net = SORT_NET_RX; dirty = 1; }
+                        if (c == '2' || c == 0x02) { sort_col_net = SORT_NET_TX; dirty = 1; }
+                    }
+
+                    if (mode == MODE_STORAGE) {
+                        if (c == '1' || c == 0x01) { if (sort_col_disk == SORT_DISK_RIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RIO; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == 0x02) { if (sort_col_disk == SORT_DISK_WIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WIO; sort_desc = 1; } dirty = 1; }
+                        if (c == '3' || c == 0x03) { if (sort_col_disk == SORT_DISK_RMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '4' || c == 0x04) { if (sort_col_disk == SORT_DISK_WMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '5' || c == 0x05) { if (sort_col_disk == SORT_DISK_RLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RLAT; sort_desc = 1; } dirty = 1; }
+                        if (c == '6' || c == 0x06) { if (sort_col_disk == SORT_DISK_WLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WLAT; sort_desc = 1; } dirty = 1; }
+                    }
                 }
             }
         }
