@@ -1,5 +1,4 @@
 #define _GNU_SOURCE
-// kvmtop - KVM Monitoring Tool - Force Sync 2
 #include <ctype.h>
 #include <dirent.h>
 #include <errno.h>
@@ -73,11 +72,15 @@ typedef struct {
     unsigned long long wio;
     unsigned long long rsect;
     unsigned long long wsect;
+    unsigned long long ruse; // Time spent reading (ms)
+    unsigned long long wuse; // Time spent writing (ms)
     
     double r_iops;
     double w_iops;
     double r_mib;
     double w_mib;
+    double r_lat; // ms
+    double w_lat; // ms
 } disk_sample_t;
 
 typedef struct {
@@ -447,6 +450,7 @@ static int collect_disks(vec_disk_t *out) {
             strncpy(ds.name, name, sizeof(ds.name)-1);
             ds.rio = rio; ds.wio = wio;
             ds.rsect = rsect; ds.wsect = wsect;
+            ds.ruse = ruse; ds.wuse = wuse;
             vec_disk_push(out, &ds);
         }
     }
@@ -649,7 +653,9 @@ static int sort_desc = 1;
 typedef enum { 
     SORT_PID=1, SORT_CPU, SORT_LOG_R, SORT_LOG_W, SORT_WAIT, SORT_RMIB, SORT_WMIB,
     SORT_NET_RX, SORT_NET_TX,
-    SORT_MEM_RES, SORT_MEM_SHR, SORT_MEM_VIRT, SORT_USER, SORT_UPTIME 
+    SORT_MEM_RES, SORT_MEM_SHR, SORT_MEM_VIRT, SORT_USER, SORT_UPTIME,
+    // Disk specific
+    SORT_DISK_RIO, SORT_DISK_WIO, SORT_DISK_RMIB, SORT_DISK_WMIB, SORT_DISK_RLAT, SORT_DISK_WLAT
 } sort_col_t;
 
 // Helper macro for numeric comparison
@@ -704,6 +710,31 @@ static int cmp_disk_rio(const void *a, const void *b) {
     const disk_sample_t *x = (const disk_sample_t *)a;
     const disk_sample_t *y = (const disk_sample_t *)b;
     return CMP_NUM(x->r_iops, y->r_iops);
+}
+static int cmp_disk_wio(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return CMP_NUM(x->w_iops, y->w_iops);
+}
+static int cmp_disk_rmib(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return CMP_NUM(x->r_mib, y->r_mib);
+}
+static int cmp_disk_wmib(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return CMP_NUM(x->w_mib, y->w_mib);
+}
+static int cmp_disk_rlat(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return CMP_NUM(x->r_lat, y->r_lat);
+}
+static int cmp_disk_wlat(const void *a, const void *b) {
+    const disk_sample_t *x = (const disk_sample_t *)a;
+    const disk_sample_t *y = (const disk_sample_t *)b;
+    return CMP_NUM(x->w_lat, y->w_lat);
 }
 
 static int cmp_tgid(const void *a, const void *b) {
@@ -786,6 +817,9 @@ int main(int argc, char **argv) {
     
     int in_limit_mode = 0;
     char limit_str[16] = {0};
+    
+    int in_refresh_mode = 0;
+    char refresh_str[16] = {0};
 
     display_mode_t mode = MODE_PROCESS;
     
@@ -845,6 +879,7 @@ int main(int argc, char **argv) {
     enable_raw_mode();
     sort_col_t sort_col_proc = SORT_CPU;
     sort_col_t sort_col_net = SORT_NET_TX;
+    sort_col_t sort_col_disk = SORT_DISK_RIO;
 
     while (1) {
         double t_curr = 0;
@@ -932,11 +967,16 @@ int main(int argc, char **argv) {
                     uint64_t dwio = (cd->wio >= pd->wio) ? cd->wio - pd->wio : 0;
                     uint64_t drs  = (cd->rsect >= pd->rsect) ? cd->rsect - pd->rsect : 0;
                     uint64_t dws  = (cd->wsect >= pd->wsect) ? cd->wsect - pd->wsect : 0;
+                    uint64_t dt_r = (cd->ruse >= pd->ruse) ? cd->ruse - pd->ruse : 0;
+                    uint64_t dt_w = (cd->wuse >= pd->wuse) ? cd->wuse - pd->wuse : 0;
                     
                     cd->r_iops = (double)drio / dt;
                     cd->w_iops = (double)dwio / dt;
                     cd->r_mib  = ((double)drs * 512.0) / (dt * 1048576.0);
                     cd->w_mib  = ((double)dws * 512.0) / (dt * 1048576.0);
+                    
+                    if (drio > 0) cd->r_lat = (double)dt_r / (double)drio; else cd->r_lat = 0;
+                    if (dwio > 0) cd->w_lat = (double)dt_w / (double)dwio; else cd->w_lat = 0;
                 }
             }
 
@@ -963,12 +1003,14 @@ int main(int argc, char **argv) {
                     snprintf(right, sizeof(right), "FILTER: %s_", filter_str);
                 } else if (in_limit_mode) {
                     snprintf(right, sizeof(right), "LIMIT: %s_", limit_str);
+                } else if (in_refresh_mode) {
+                    snprintf(right, sizeof(right), "REFRESH(s): %s_", refresh_str);
                 } else {
                     // Normal header
                     char f_info[40] = "";
                     if (strlen(filter_str) > 0) snprintf(f_info, sizeof(f_info), "Filter: %s | ", filter_str);
                     
-                    snprintf(right, sizeof(right), "%sRefresh=%.1fs | [c] CPU | [s] Storage | [n] Net | [t] Tree | [l] Limit(%d) | [f] Freeze: %s | [/] Filter | [q] Quit", 
+                    snprintf(right, sizeof(right), "%sRefresh=%.1fs | [c] CPU | [s] Storage | [n] Net | [t] Tree | [l] Limit(%d) | [r] Rate | [f] Freeze: %s | [/] Filter | [q] Quit", 
                              f_info, interval, display_limit, frozen ? "ON" : "OFF");
                 }
                 
@@ -979,7 +1021,7 @@ int main(int argc, char **argv) {
                 printf("System IOPS: Read %.0f | Write %.0f\n", sys_r_iops, sys_w_iops);
 
                 if (mode == MODE_NETWORK) {
-                    if (sort_col_net == SORT_NET_RX)
+                    if (sort_col_net == SORT_NET_RX) 
                         qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_rx);
                     else
                         qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_tx);
@@ -1022,30 +1064,43 @@ int main(int argc, char **argv) {
                         count++;
                     }
                 } else if (mode == MODE_STORAGE) {
-                    qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio); 
+                    switch(sort_col_disk) {
+                        case SORT_DISK_RIO: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio); break;
+                        case SORT_DISK_WIO: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_wio); break;
+                        case SORT_DISK_RMIB: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rmib); break;
+                        case SORT_DISK_WMIB: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_wmib); break;
+                        case SORT_DISK_RLAT: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rlat); break;
+                        case SORT_DISK_WLAT: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_wlat); break;
+                        default: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio); break;
+                    }
 
-                    int devw=16, iopsw=12, mibw=12;
-                    char h_ri[32], h_wi[32], h_rm[32], h_wm[32];
-                    snprintf(h_ri, 32, "R_IOPS");
-                    snprintf(h_wi, 32, "W_IOPS");
-                    snprintf(h_rm, 32, "R_MiB/s");
-                    snprintf(h_wm, 32, "W_MiB/s");
+                    int devw=16, iopsw=12, mibw=12, latw=12;
+                    char h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_rl[32], h_wl[32];
+                    snprintf(h_ri, 32, "[1] R_IOPS");
+                    snprintf(h_wi, 32, "[2] W_IOPS");
+                    snprintf(h_rm, 32, "[3] R_MiB/s");
+                    snprintf(h_wm, 32, "[4] W_MiB/s");
+                    snprintf(h_rl, 32, "[5] R_Lat(ms)");
+                    snprintf(h_wl, 32, "[6] W_Lat(ms)");
 
-                    printf("%*s %*s %*s %*s %*s\n",
-                        devw, "DEVICE", iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm);
+                    printf("%*s %*s %*s %*s %*s %*s %*s\n",
+                        devw, "DEVICE", iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm, latw, h_rl, latw, h_wl);
                     
                     for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
                     for (size_t i=0; i<curr_disk.len; i++) {
                         const disk_sample_t *d = &curr_disk.data[i];
+                        // Filter
                         if (strlen(filter_str) > 0 && !strcasestr(d->name, filter_str)) continue;
 
-                        printf("%*s %*.*f %*.*f %*.*f %*.*f\n",
+                        printf("%*s %*.*f %*.*f %*.*f %*.*f %*.*f %*.*f\n",
                             devw, d->name,
                             iopsw, 2, d->r_iops,
                             iopsw, 2, d->w_iops,
                             mibw, 2, d->r_mib,
-                            mibw, 2, d->w_mib);
+                            mibw, 2, d->w_mib,
+                            latw, 2, d->r_lat,
+                            latw, 2, d->w_lat);
                     }
                 } else { // MODE_PROCESS
                     vec_t *view_list = &curr_proc; 
@@ -1065,8 +1120,6 @@ int main(int argc, char **argv) {
                     int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 3, iopsw=10, waitw=8, mibw=10;
                     
                     // Headers
-                    // Order: PID, User, Uptime, Res, Shr, Virt, R_Log, W_Log, Wait, R_MiB, W_MiB, CPU, State, COMMAND
-                    
                     int fixed_width = pidw + 1 + cpuw + 1 + 
                                       memw + 1 + memw + 1 + memw + 1 + 
                                       uptimew + 1 + userw + 1 + 
@@ -1181,84 +1234,6 @@ int main(int argc, char **argv) {
                             mibw, 0, t_rm,
                             mibw, 0, t_wm,
                             cpuw, 2, t_cpu);
-                }
-                fflush(stdout);
-                dirty = 0;
-            }
-
-            double elapsed = now_monotonic() - start_wait;
-            double remain = interval - elapsed;
-            if (remain <= 0) break;
-
-            int c = wait_for_input(remain);
-            if (c > 0) {
-                if (in_filter_mode) {
-                    if (c == 27) { // ESC
-                        in_filter_mode = 0;
-                        filter_str[0] = '\0';
-                        dirty = 1;
-                    } else if (c == 127 || c == 8) { // Backspace
-                        size_t len = strlen(filter_str);
-                        if (len > 0) filter_str[len-1] = '\0';
-                        dirty = 1;
-                    } else if (c == '\n' || c == '\r') {
-                        in_filter_mode = 0;
-                        dirty = 1;
-                    } else if (isprint(c)) {
-                        size_t len = strlen(filter_str);
-                        if (len < sizeof(filter_str)-1) {
-                            filter_str[len] = (char)c;
-                            filter_str[len+1] = '\0';
-                        }
-                        dirty = 1;
-                    }
-                } else if (in_limit_mode) {
-                    if (c == 27) { // ESC
-                        in_limit_mode = 0;
-                        limit_str[0] = '\0';
-                        dirty = 1;
-                    } else if (c == 127 || c == 8) {
-                        size_t len = strlen(limit_str);
-                        if (len > 0) limit_str[len-1] = '\0';
-                        dirty = 1;
-                    } else if (c == '\n' || c == '\r') {
-                        if (strlen(limit_str) > 0) {
-                            int val = atoi(limit_str);
-                            if (val > 0) display_limit = val;
-                        }
-                        in_limit_mode = 0;
-                        limit_str[0] = '\0';
-                        dirty = 1;
-                    } else if (isdigit(c)) {
-                        size_t len = strlen(limit_str);
-                        if (len < sizeof(limit_str)-1) {
-                            limit_str[len] = (char)c;
-                            limit_str[len+1] = '\0';
-                        }
-                        dirty = 1;
-                    }
-                } else {
-                    if (c == '/') { in_filter_mode = 1; dirty = 1; }
-                    if (c == 'l' || c == 'L') { in_limit_mode = 1; limit_str[0]='\0'; dirty = 1; }
-                    if (c == 'q' || c == 'Q') goto cleanup;
-                    if (c == 'f' || c == 'F') { frozen = !frozen; dirty = 1; }
-                    if (c == 't' || c == 'T') { show_tree = !show_tree; mode = MODE_PROCESS; dirty = 1; }
-                    if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
-                    if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
-                    if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
-                    
-                    if (mode == MODE_PROCESS) {
-                        if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
-                        if (c == '2' || c == 0x02) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
-                        if (c == '3' || c == 0x03) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
-                        if (c == '4' || c == 0x04) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
-                        if (c == '5' || c == 0x05) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
-                        if (c == '6' || c == 0x06) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
-                        if (c == '7' || c == 0x07) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
-                    } else { // MODE_NETWORK
-                        if (c == '1' || c == 0x01) { sort_col_net = SORT_NET_RX; dirty = 1; }
-                        if (c == '2' || c == 0x02) { sort_col_net = SORT_NET_TX; dirty = 1; }
-                    }
                 }
             }
         }
