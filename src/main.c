@@ -1063,7 +1063,7 @@ int main(int argc, char **argv) {
                     char f_info[40] = "";
                     if (strlen(filter_str) > 0) snprintf(f_info, sizeof(f_info), "Filter: %s | ", filter_str);
                     
-                    snprintf(right, sizeof(right), "%sRefresh=%.1fs | [c] CPU | [s] Storage | [n] Net | [t] Tree | [l] Limit(%d) | [r] Rate | [f] Freeze: %s | [/] Filter | [q] Quit", 
+                    snprintf(right, sizeof(right), "%s[r] Refresh=%.1fs | [c] CPU | [s] Storage | [n] Net | [t] Tree | [l] Limit(%d) | [f] Freeze: %s | [/] Filter | [q] Quit", 
                              f_info, interval, display_limit, frozen ? "ON" : "OFF");
                 }
                 
@@ -1214,7 +1214,7 @@ int main(int argc, char **argv) {
                         mibw, "[7] W_MiB",
                         cpuw, "[2] CPU%",
                         statew, "[8] S",
-                        "COMMAND LINE"
+                        "COMMAND"
                     );
                     
                     for(int i=0; i<cols; i++) putchar('-');
