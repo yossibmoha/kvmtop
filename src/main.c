@@ -57,7 +57,7 @@ typedef struct {
     uint64_t mem_shr_pages;
 
     double cpu_pct; 
-    double sys_cpu_pct; // New field
+    double sys_cpu_pct; 
     double r_iops;
     double w_iops;
     double io_wait_ms;
@@ -362,7 +362,7 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     char *p = rparen + 2; 
     if (*p) *state_out = *p; else *state_out = '?';
 
-    char *save = NULL; char *tok = strtok_r(p, " ", &save); 
+    char *save = NULL; char *tok = strtok_r(p, " ", &save);
     int idx = 0; 
     uint64_t utime=0, stime=0;
     *blkio_ticks_out = 0;
@@ -913,7 +913,7 @@ int main(int argc, char **argv) {
     memset(&curr_cpu, 0, sizeof(curr_cpu));
     read_global_cpu(&prev_cpu);
 
-    printf("Initializing (wait %.0fs)...\n"
+    printf("Initializing (wait %.0fs)...\n", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
@@ -984,8 +984,7 @@ int main(int argc, char **argv) {
                 c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
             }
 
-            // Net & Disk Deltas (Existing Logic omitted for brevity, assume same as before)
-             // Net Metrics
+            // Net Metrics
             for (size_t i=0; i<curr_net.len; i++) {
                 net_iface_t *cn = &curr_net.data[i];
                 net_iface_t *pn = NULL;
@@ -1219,12 +1218,11 @@ int main(int argc, char **argv) {
                         mibw, 2, "W_MiB",
                         cpuw, 2, "CPU%",
                         sysw, "Sys%",
-                        statew, 'S',
+                        statew, "[8] S",
                         "COMMAND LINE"
                     );
                     
-                    for(int i=0; i<cols; i++) putchar('-');
-                    putchar('\n');
+                    for(int i=0; i<cols; i++) putchar('-'); putchar('\n');
 
                     // Calc totals
                     double t_cpu=0, t_sys=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
@@ -1273,7 +1271,7 @@ int main(int argc, char **argv) {
                         if (days > 0) snprintf(uptime_buf, 32, "%dd%02dh", days, hrs);
                         else snprintf(uptime_buf, 32, "%02d:%02d:%02d", hrs, mins, secs);
 
-                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
+                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*c ",
                             pidw, pidbuf,
                             userw, c->user,
                             uptimew, uptime_buf,
