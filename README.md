@@ -10,12 +10,11 @@ It bridges the visibility gap by automatically correlating low-level system proc
 
 ```bash
 # Download the latest static binary
-wget https://github.com/yossibmoha/kvmtop/releases/download/v1.0.2/kvmtop-linux-amd64-static
-chmod +x kvmtop-linux-amd64-static
-sudo mv kvmtop-linux-amd64-static /usr/local/bin/kvmtop
+wget -O /usr/local/bin/kvmtop https://github.com/yossibmoha/kvmtop/releases/download/v2026.01.06.7/kvmtop-static-linux-amd64
+chmod +x /usr/local/bin/kvmtop
 
-# Run (sudo recommended for full I/O statistics)
-sudo kvmtop
+# Run (root recommended for full I/O statistics)
+kvmtop
 ```
 
 **Or build from source:**

@@ -8,6 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Mouse support for sorting** - click column headers to sort (SGR extended mouse mode)
 - Help screen overlay (`h` key) with complete keyboard shortcut reference
 - Visual sort column indicator (`*` mark on active sort column)
 - Page fault tracking (minor and major faults per second)
@@ -75,12 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 |---------|--------------|--------------|
 | 1.0.0 | 2023-12 | Initial release, basic monitoring |
 | 1.0.1 | 2024-01 | Storage view, enhanced metrics |
-| Unreleased | TBD | Help screen, colors, enhanced docs |
+| Unreleased | TBD | Mouse support, help screen, colors, config file |
 
 ## Upgrade Notes
 
 ### Upgrading to Unreleased Version
 
+- **Mouse support** - click column headers to sort (requires terminal with mouse support)
 - New `~/.kvmtoprc` configuration file support (optional)
 - Color output is enabled by default (disable with `color=off` in config)
 - Help screen available with `h` key
@@ -137,6 +139,7 @@ If you discover a security vulnerability, please email security@example.com inst
 - Designed for KVM/QEMU only (not VirtualBox, VMware, etc.)
 - Requires Linux kernel 2.6.26+ for `/proc` interface
 - Color support requires ANSI-compatible terminal
+- Mouse support requires terminal with SGR mouse mode (most modern terminals)
 
 ## Future Plans
 
@@ -152,7 +155,7 @@ Planned features for upcoming releases:
 - NUMA topology awareness
 - Hugepage usage tracking
 - Container/cgroup detection
-- Mouse support for terminal interaction
+- ~~Mouse support for terminal interaction~~ ✅ (implemented in Unreleased)
 
 ### v2.0.0
 - Multi-host monitoring (SSH aggregation)
