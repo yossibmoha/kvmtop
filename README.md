@@ -73,13 +73,14 @@ Complete documentation is available in the [`docs/`](docs/) folder:
 | `s` | Storage/disk view |
 | `n` | Network view |
 | `t` | Toggle tree mode (threads) |
+| `e` | Export current view to CSV |
 | `/` | Filter by name/PID/user/VM |
 | `f` | Freeze/resume display |
 | `l` | Set display limit |
 | `r` | Set refresh interval |
 | `q` | Quit |
 
-Press `1-8` to sort by different columns (varies by view). Press `h` for complete shortcuts.
+**Sorting:** Use `F1-F8` (htop-style) or `1-8` keys. Press same key to toggle sort direction. Press `h` for complete shortcuts.
 
 ## 🔧 Examples
 

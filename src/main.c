@@ -401,6 +401,85 @@ static const char* reset_color(void) {
     return color_enabled ? COLOR_RESET : "";
 }
 
+// Print htop-style footer bar
+static void print_footer_bar(display_mode_t mode, int frozen, int cols) {
+    // Move to bottom of screen and print footer
+    printf("\033[%d;1H", 999);  // Move to bottom
+    printf("\033[7m");  // Reverse video
+    
+    if (mode == MODE_PROCESS || mode == MODE_TREE) {
+        printf(" F1");
+        printf("\033[0m");
+        printf("PID ");
+        printf("\033[7m");
+        printf("F2");
+        printf("\033[0m");
+        printf("CPU ");
+        printf("\033[7m");
+        printf("F5");
+        printf("\033[0m");
+        printf("Wait ");
+    } else if (mode == MODE_NETWORK) {
+        printf(" F1");
+        printf("\033[0m");
+        printf("RX ");
+        printf("\033[7m");
+        printf("F2");
+        printf("\033[0m");
+        printf("TX ");
+    } else if (mode == MODE_STORAGE) {
+        printf(" F1");
+        printf("\033[0m");
+        printf("R_IOPS ");
+        printf("\033[7m");
+        printf("F2");
+        printf("\033[0m");
+        printf("W_IOPS ");
+    }
+    
+    // Common keys
+    printf("\033[7m");
+    printf(" c");
+    printf("\033[0m");
+    printf("CPU ");
+    printf("\033[7m");
+    printf("n");
+    printf("\033[0m");
+    printf("Net ");
+    printf("\033[7m");
+    printf("s");
+    printf("\033[0m");
+    printf("Disk ");
+    printf("\033[7m");
+    printf("t");
+    printf("\033[0m");
+    printf("Tree ");
+    printf("\033[7m");
+    printf("f");
+    printf("\033[0m");
+    printf("%s ", frozen ? "FROZEN" : "Freeze");
+    printf("\033[7m");
+    printf("/");
+    printf("\033[0m");
+    printf("Filter ");
+    printf("\033[7m");
+    printf("e");
+    printf("\033[0m");
+    printf("Export ");
+    printf("\033[7m");
+    printf("h");
+    printf("\033[0m");
+    printf("Help ");
+    printf("\033[7m");
+    printf("q");
+    printf("\033[0m");
+    printf("Quit");
+    
+    // Clear rest of line
+    printf("\033[K");
+    printf("\033[0m");
+}
+
 // Export current view to CSV
 static void export_csv(const char *mode_name, vec_t *proc_data, vec_net_t *net_data, vec_disk_t *disk_data, display_mode_t mode) {
     char filename[128];
@@ -1630,6 +1709,10 @@ int main(int argc, char **argv) {
                             mibw, 0, t_wm,
                             cpuw, 2, t_cpu);
                 }
+                
+                // Print htop-style footer bar
+                print_footer_bar(mode, frozen, cols);
+                
                 fflush(stdout);
                 dirty = 0;
             }

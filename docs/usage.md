@@ -50,7 +50,8 @@ Switch between different monitoring views:
 | `s` | **Storage View** | Block device I/O statistics and latency |
 | `n` | **Network View** | Network interface traffic and VM mapping |
 | `t` | **Tree View** | Toggle thread tree visualization (in Process mode) |
-| `h` | **Help Screen** | Show this help documentation |
+| `h` | **Help Screen** | Show keyboard shortcut reference |
+| `e` | **Export** | Export current view to CSV file |
 
 ### Interactive Controls
 
@@ -62,40 +63,42 @@ Switch between different monitoring views:
 | `/` | **Filter** | Enter filter mode to search by PID, name, user, or VM |
 | `q` | **Quit** | Exit kvmtop |
 
+### Sorting (htop-style)
+
+kvmtop supports htop-style sorting using **function keys (F1-F8)** or **number keys (1-8)**:
+
+> **Tip:** Press the same key twice to toggle between ascending and descending order. The sort indicator (`v` or `^`) shows current direction.
+
 ### Sorting - Process View
 
-Press number keys to sort by different columns:
-
-| Key | Sort By | Description |
-|-----|---------|-------------|
-| `1` | PID | Process ID (toggle ascending/descending) |
-| `2` | CPU% | CPU usage percentage |
-| `3` | R_Log | Read logical IOPS (system calls) |
-| `4` | W_Log | Write logical IOPS (system calls) |
-| `5` | Wait | I/O wait time in milliseconds |
-| `6` | R_MiB | Read bandwidth in MiB/s |
-| `7` | W_MiB | Write bandwidth in MiB/s |
-| `8` | State | Process state (R/S/D/Z) |
-
-> **Tip:** Press the same number key twice to toggle between ascending and descending order.
+| Key | Alt Key | Sort By | Description |
+|-----|---------|---------|-------------|
+| `F1` | `1` | PID | Process ID |
+| `F2` | `2` | CPU% | CPU usage percentage |
+| `F3` | `3` | R_Log | Read logical IOPS (system calls) |
+| `F4` | `4` | W_Log | Write logical IOPS (system calls) |
+| `F5` | `5` | Wait | I/O wait time in milliseconds |
+| `F6` | `6` | R_MiB | Read bandwidth in MiB/s |
+| `F7` | `7` | W_MiB | Write bandwidth in MiB/s |
+| `F8` | `8` | State | Process state (R/S/D/Z) |
 
 ### Sorting - Network View
 
-| Key | Sort By | Description |
-|-----|---------|-------------|
-| `1` | RX | Receive rate in Mbps |
-| `2` | TX | Transmit rate in Mbps |
+| Key | Alt Key | Sort By | Description |
+|-----|---------|---------|-------------|
+| `F1` | `1` | RX | Receive rate in Mbps |
+| `F2` | `2` | TX | Transmit rate in Mbps |
 
 ### Sorting - Storage View
 
-| Key | Sort By | Description |
-|-----|---------|-------------|
-| `1` | R_IOPS | Read operations per second |
-| `2` | W_IOPS | Write operations per second |
-| `3` | R_MiB/s | Read throughput |
-| `4` | W_MiB/s | Write throughput |
-| `5` | R_Lat | Read latency in milliseconds |
-| `6` | W_Lat | Write latency in milliseconds |
+| Key | Alt Key | Sort By | Description |
+|-----|---------|---------|-------------|
+| `F1` | `1` | R_IOPS | Read operations per second |
+| `F2` | `2` | W_IOPS | Write operations per second |
+| `F3` | `3` | R_MiB/s | Read throughput |
+| `F4` | `4` | W_MiB/s | Write throughput |
+| `F5` | `5` | R_Lat | Read latency in milliseconds |
+| `F6` | `6` | W_Lat | Write latency in milliseconds |
 
 ## Interactive Features
 
