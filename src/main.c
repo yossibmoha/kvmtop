@@ -401,18 +401,108 @@ static const char* reset_color(void) {
     return color_enabled ? COLOR_RESET : "";
 }
 
+// Export current view to CSV
+static void export_csv(const char *mode_name, vec_t *proc_data, vec_net_t *net_data, vec_disk_t *disk_data, display_mode_t mode) {
+    char filename[128];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    strftime(filename, sizeof(filename), "kvmtop_%Y%m%d_%H%M%S.csv", tm_info);
+    
+    FILE *f = fopen(filename, "w");
+    if (!f) {
+        return;
+    }
+    
+    if (mode == MODE_PROCESS || mode == MODE_TREE) {
+        fprintf(f, "PID,User,Uptime,Res_MiB,Shr_MiB,Virt_MiB,R_Log,W_Log,Wait_ms,R_MiB,W_MiB,CPU_pct,State,Command\n");
+        for (size_t i = 0; i < proc_data->len; i++) {
+            sample_t *s = &proc_data->data[i];
+            double res_mib = (double)s->mem_res_pages * 4096.0 / 1048576.0;
+            double shr_mib = (double)s->mem_shr_pages * 4096.0 / 1048576.0;
+            double virt_mib = (double)s->mem_virt_pages * 4096.0 / 1048576.0;
+            fprintf(f, "%d,%s,0,%.0f,%.0f,%.0f,%.0f,%.0f,%.2f,%.2f,%.2f,%.2f,%c,\"%s\"\n",
+                s->tgid, s->user, res_mib, shr_mib, virt_mib,
+                s->r_iops, s->w_iops, s->io_wait_ms, s->r_mib, s->w_mib,
+                s->cpu_pct, s->state, s->cmd);
+        }
+    } else if (mode == MODE_NETWORK) {
+        fprintf(f, "Interface,State,RX_Mbps,TX_Mbps,RX_Pkts,TX_Pkts,RX_Err,TX_Err,VMID,VM_Name\n");
+        for (size_t i = 0; i < net_data->len; i++) {
+            net_iface_t *n = &net_data->data[i];
+            fprintf(f, "%s,%s,%.2f,%.2f,%.0f,%.0f,%.0f,%.0f,%d,%s\n",
+                n->name, n->operstate, n->rx_mbps, n->tx_mbps,
+                n->rx_pps, n->tx_pps, n->rx_errs_ps, n->tx_errs_ps,
+                n->vmid, n->vm_name);
+        }
+    } else if (mode == MODE_STORAGE) {
+        fprintf(f, "Device,R_IOPS,W_IOPS,R_MiB_s,W_MiB_s,R_Lat_ms,W_Lat_ms,Util_pct\n");
+        for (size_t i = 0; i < disk_data->len; i++) {
+            disk_sample_t *d = &disk_data->data[i];
+            fprintf(f, "%s,%.2f,%.2f,%.2f,%.2f,%.4f,%.4f,%.2f\n",
+                d->name, d->r_iops, d->w_iops, d->r_mib, d->w_mib,
+                d->r_lat, d->w_lat, d->util_pct);
+        }
+    }
+    
+    fclose(f);
+    // Show message briefly - will be overwritten on next refresh
+    printf("\033[2J\033[H");
+    printf("Exported to: %s\n\nPress any key to continue...", filename);
+    fflush(stdout);
+    wait_for_input(999999);
+}
+
+// Load configuration from ~/.kvmtoprc
+static void load_config(double *interval, int *limit) {
+    char path[PATH_MAX];
+    const char *home = getenv("HOME");
+    if (!home) return;
+    
+    snprintf(path, sizeof(path), "%s/.kvmtoprc", home);
+    FILE *f = fopen(path, "r");
+    if (!f) return;
+    
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        // Skip comments and empty lines
+        char *p = line;
+        while (*p && isspace(*p)) p++;
+        if (*p == '#' || *p == '\0' || *p == '\n') continue;
+        
+        // Parse key=value
+        char key[64], value[64];
+        if (sscanf(p, "%63[^=]=%63s", key, value) == 2) {
+            // Trim key
+            char *end = key + strlen(key) - 1;
+            while (end > key && isspace(*end)) *end-- = '\0';
+            
+            if (strcmp(key, "interval") == 0) {
+                double v = strtod(value, NULL);
+                if (v >= 0.1) *interval = v;
+            } else if (strcmp(key, "limit") == 0) {
+                int v = atoi(value);
+                if (v > 0) *limit = v;
+            } else if (strcmp(key, "color") == 0) {
+                color_enabled = (strcmp(value, "on") == 0 || strcmp(value, "1") == 0);
+            }
+        }
+    }
+    fclose(f);
+}
+
 static void print_help_screen(void) {
     printf("\033[2J\033[H");
-    printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
-    printf("║                          kvmtop %s - Help                              ║\n", KVM_VERSION);
-    printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
+    printf("╔═══════════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                            kvmtop %s - Help                                ║\n", KVM_VERSION);
+    printf("╚═══════════════════════════════════════════════════════════════════════════════╝\n\n");
     
     printf("  VIEW CONTROLS:\n");
     printf("    c       - Switch to Process/CPU view (main dashboard)\n");
     printf("    s       - Switch to Storage/Disk view\n");
     printf("    n       - Switch to Network view\n");
     printf("    t       - Toggle Tree mode (show threads in process view)\n");
-    printf("    h       - Show this help screen\n\n");
+    printf("    h       - Show this help screen\n");
+    printf("    e       - Export current view to CSV file\n\n");
     
     printf("  INTERACTIVE CONTROLS:\n");
     printf("    f       - Freeze/Resume display updates\n");
@@ -421,33 +511,29 @@ static void print_help_screen(void) {
     printf("    /       - Enter filter mode (search by PID, name, user, VM)\n");
     printf("    q       - Quit kvmtop\n\n");
     
-    printf("  SORTING (Process View):\n");
-    printf("    1       - Sort by PID\n");
-    printf("    2       - Sort by CPU%%\n");
-    printf("    3       - Sort by Read Logs (logical IOPS)\n");
-    printf("    4       - Sort by Write Logs (logical IOPS)\n");
-    printf("    5       - Sort by IO Wait (latency)\n");
-    printf("    6       - Sort by Read Bandwidth (MiB/s)\n");
-    printf("    7       - Sort by Write Bandwidth (MiB/s)\n");
-    printf("    8       - Sort by State\n\n");
+    printf("  SORTING (htop-style: use F1-F8 or number keys 1-8):\n");
+    printf("    Press same key again to toggle ascending/descending order\n\n");
     
-    printf("  SORTING (Network View):\n");
-    printf("    1       - Sort by RX (Receive Mbps)\n");
-    printf("    2       - Sort by TX (Transmit Mbps)\n\n");
-    
-    printf("  SORTING (Storage View):\n");
-    printf("    1       - Sort by Read IOPS\n");
-    printf("    2       - Sort by Write IOPS\n");
-    printf("    3       - Sort by Read MiB/s\n");
-    printf("    4       - Sort by Write MiB/s\n");
-    printf("    5       - Sort by Read Latency\n");
-    printf("    6       - Sort by Write Latency\n\n");
+    printf("    Process View:     Network View:     Storage View:\n");
+    printf("    F1/1 - PID        F1/1 - RX Mbps    F1/1 - Read IOPS\n");
+    printf("    F2/2 - CPU%%       F2/2 - TX Mbps    F2/2 - Write IOPS\n");
+    printf("    F3/3 - Read Logs                    F3/3 - Read MiB/s\n");
+    printf("    F4/4 - Write Logs                   F4/4 - Write MiB/s\n");
+    printf("    F5/5 - IO Wait                      F5/5 - Read Latency\n");
+    printf("    F6/6 - Read MiB/s                   F6/6 - Write Latency\n");
+    printf("    F7/7 - Write MiB/s\n");
+    printf("    F8/8 - State\n\n");
     
     printf("  COMMAND-LINE OPTIONS:\n");
     printf("    -i, --interval <sec>   Set refresh interval (default: 5.0)\n");
     printf("    -p, --pid <PID>        Monitor specific process ID(s)\n");
     printf("    -v, --version          Show version information\n");
     printf("    -h, --help             Show help message\n\n");
+    
+    printf("  CONFIG FILE: ~/.kvmtoprc\n");
+    printf("    interval=2.0           # Default refresh interval\n");
+    printf("    limit=100              # Default display limit\n");
+    printf("    color=on               # Enable color output\n\n");
     
     printf("  Press any key to return...");
     fflush(stdout);
@@ -1070,6 +1156,9 @@ int main(int argc, char **argv) {
     
     int in_refresh_mode = 0;
     char refresh_str[16] = {0};
+    
+    // Load configuration file (overrides defaults)
+    load_config(&interval, &display_limit);
 
     display_mode_t mode = MODE_PROCESS;
     
@@ -1317,9 +1406,10 @@ int main(int argc, char **argv) {
                         qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_tx);
 
                     int namew=16, statw=10, ratew=12, pktw=10, errw=8;
+                    const char *nsort_ind = sort_desc ? "v" : "^";
                     char h_rx[32], h_tx[32];
-                    snprintf(h_rx, 32, "[1] RX_Mbps%s", sort_col_net == SORT_NET_RX ? "*" : "");
-                    snprintf(h_tx, 32, "[2] TX_Mbps%s", sort_col_net == SORT_NET_TX ? "*" : "");
+                    snprintf(h_rx, 32, "F1 RX_Mbps%s", sort_col_net == SORT_NET_RX ? nsort_ind : "");
+                    snprintf(h_tx, 32, "F2 TX_Mbps%s", sort_col_net == SORT_NET_TX ? nsort_ind : "");
 
                     printf("%*s %*s %*s %*s %*s %*s %*s %*s %-6s %s\n",
                         namew, "IFACE", statw, "STATE", 
@@ -1364,14 +1454,15 @@ int main(int argc, char **argv) {
                         default: qsort(curr_disk.data, curr_disk.len, sizeof(disk_sample_t), cmp_disk_rio); break;
                     }
 
-                    int devw=16, iopsw=12, mibw=12, latw=12;
+                    int devw=16, iopsw=12, mibw=12, latw=14;
+                    const char *dsort_ind = sort_desc ? "v" : "^";
                     char h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_rl[32], h_wl[32];
-                    snprintf(h_ri, 32, "[1] R_IOPS%s", sort_col_disk == SORT_DISK_RIO ? "*" : "");
-                    snprintf(h_wi, 32, "[2] W_IOPS%s", sort_col_disk == SORT_DISK_WIO ? "*" : "");
-                    snprintf(h_rm, 32, "[3] R_MiB/s%s", sort_col_disk == SORT_DISK_RMIB ? "*" : "");
-                    snprintf(h_wm, 32, "[4] W_MiB/s%s", sort_col_disk == SORT_DISK_WMIB ? "*" : "");
-                    snprintf(h_rl, 32, "[5] R_Lat(ms)%s", sort_col_disk == SORT_DISK_RLAT ? "*" : "");
-                    snprintf(h_wl, 32, "[6] W_Lat(ms)%s", sort_col_disk == SORT_DISK_WLAT ? "*" : "");
+                    snprintf(h_ri, 32, "F1 R_IOPS%s", sort_col_disk == SORT_DISK_RIO ? dsort_ind : "");
+                    snprintf(h_wi, 32, "F2 W_IOPS%s", sort_col_disk == SORT_DISK_WIO ? dsort_ind : "");
+                    snprintf(h_rm, 32, "F3 R_MiB/s%s", sort_col_disk == SORT_DISK_RMIB ? dsort_ind : "");
+                    snprintf(h_wm, 32, "F4 W_MiB/s%s", sort_col_disk == SORT_DISK_WMIB ? dsort_ind : "");
+                    snprintf(h_rl, 32, "F5 R_Lat(ms)%s", sort_col_disk == SORT_DISK_RLAT ? dsort_ind : "");
+                    snprintf(h_wl, 32, "F6 W_Lat(ms)%s", sort_col_disk == SORT_DISK_WLAT ? dsort_ind : "");
 
                     printf("%*s %*s %*s %*s %*s %*s %*s\n",
                         devw, "DEVICE", iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm, latw, h_rl, latw, h_wl);
@@ -1421,14 +1512,16 @@ int main(int argc, char **argv) {
                     int cmdw = cols - fixed_width; 
                     if (cmdw < 10) cmdw = 10;
 
-                    char h_pid[16], h_cpu[16], h_rlog[16], h_wlog[16], h_wait[16], h_rmib[16], h_wmib[16];
-                    snprintf(h_pid, 16, "[1] PID%s", sort_col_proc == SORT_PID ? "*" : "");
-                    snprintf(h_cpu, 16, "[2] CPU%%%s", sort_col_proc == SORT_CPU ? "*" : "");
-                    snprintf(h_rlog, 16, "[3] R_Log%s", sort_col_proc == SORT_LOG_R ? "*" : "");
-                    snprintf(h_wlog, 16, "[4] W_Log%s", sort_col_proc == SORT_LOG_W ? "*" : "");
-                    snprintf(h_wait, 16, "[5] Wait%s", sort_col_proc == SORT_WAIT ? "*" : "");
-                    snprintf(h_rmib, 16, "[6] R_MiB%s", sort_col_proc == SORT_RMIB ? "*" : "");
-                    snprintf(h_wmib, 16, "[7] W_MiB%s", sort_col_proc == SORT_WMIB ? "*" : "");
+                    // Headers with htop-style F-key labels and sort direction
+                    const char *sort_ind = sort_desc ? "v" : "^";
+                    char h_pid[20], h_cpu[20], h_rlog[20], h_wlog[20], h_wait[20], h_rmib[20], h_wmib[20];
+                    snprintf(h_pid, 20, "F1 PID%s", sort_col_proc == SORT_PID ? sort_ind : "");
+                    snprintf(h_cpu, 20, "F2 CPU%s", sort_col_proc == SORT_CPU ? sort_ind : "");
+                    snprintf(h_rlog, 20, "F3 R_Log%s", sort_col_proc == SORT_LOG_R ? sort_ind : "");
+                    snprintf(h_wlog, 20, "F4 W_Log%s", sort_col_proc == SORT_LOG_W ? sort_ind : "");
+                    snprintf(h_wait, 20, "F5 Wait%s", sort_col_proc == SORT_WAIT ? sort_ind : "");
+                    snprintf(h_rmib, 20, "F6 R_MiB%s", sort_col_proc == SORT_RMIB ? sort_ind : "");
+                    snprintf(h_wmib, 20, "F7 W_MiB%s", sort_col_proc == SORT_WMIB ? sort_ind : "");
 
                     printf("%*s %-*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
                         pidw, h_pid,
@@ -1443,7 +1536,7 @@ int main(int argc, char **argv) {
                         mibw, h_rmib,
                         mibw, h_wmib,
                         cpuw, h_cpu,
-                        statew, "[8] S",
+                        statew, "F8 S",
                         "COMMAND"
                     );
                     
@@ -1496,7 +1589,8 @@ int main(int argc, char **argv) {
                         if (days > 0) snprintf(uptime_buf, 32, "%dd%02dh", days, hrs);
                         else snprintf(uptime_buf, 32, "%02d:%02d:%02d", hrs, mins, secs);
 
-                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*c ",
+                        // Print row with color coding for CPU, Wait, and State
+                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f ",
                             pidw, pidbuf,
                             userw, c->user,
                             uptimew, uptime_buf,
@@ -1504,12 +1598,14 @@ int main(int argc, char **argv) {
                             memw, shr_mib,
                             memw, virt_mib,
                             iopsw, c->r_iops,
-                            iopsw, c->w_iops,
-                            waitw, 2, c->io_wait_ms,
-                            mibw, 2, c->r_mib,
-                            mibw, 2, c->w_mib,
-                            cpuw, 2, c->cpu_pct,
-                            statew, c->state);
+                            iopsw, c->w_iops);
+                        // Wait with color
+                        printf("%s%*.*f%s ", get_wait_color(c->io_wait_ms), waitw, 2, c->io_wait_ms, reset_color());
+                        printf("%*.*f %*.*f ", mibw, 2, c->r_mib, mibw, 2, c->w_mib);
+                        // CPU with color
+                        printf("%s%*.*f%s ", get_cpu_color(c->cpu_pct), cpuw, 2, c->cpu_pct, reset_color());
+                        // State with color
+                        printf("%s%*c%s ", get_state_color(c->state), statew, c->state, reset_color());
                         fprint_trunc(stdout, c->cmd, cmdw);
                         putchar('\n');
 
@@ -1629,6 +1725,10 @@ int main(int argc, char **argv) {
                     if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
                     if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
                     if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
+                    if (c == 'e' || c == 'E') {
+                        export_csv("kvmtop", &curr_proc, &curr_net, &curr_disk, mode);
+                        dirty = 1;
+                    }
                     if (c == 'h' || c == 'H') {
                         print_help_screen();
                         wait_for_input(999999);  // Wait for any key
