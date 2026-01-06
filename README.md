@@ -4,7 +4,7 @@
 
 It bridges the visibility gap by automatically correlating low-level system processes with high-level Virtual Machine identities.
 
-![Process View](https://placeholder-for-screenshot-process-view.png)
+![Process View](assets/process-view.png)
 
 ## 🚀 Quick Start
 

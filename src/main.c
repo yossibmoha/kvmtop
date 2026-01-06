@@ -42,6 +42,22 @@
 #define THRESH_WAIT_WARN 500.0
 #define THRESH_WAIT_CRIT 1000.0
 
+// Special key codes for function keys (htop-style)
+#define KEY_F1  1001
+#define KEY_F2  1002
+#define KEY_F3  1003
+#define KEY_F4  1004
+#define KEY_F5  1005
+#define KEY_F6  1006
+#define KEY_F7  1007
+#define KEY_F8  1008
+#define KEY_F9  1009
+#define KEY_F10 1010
+#define KEY_UP    2001
+#define KEY_DOWN  2002
+#define KEY_LEFT  2003
+#define KEY_RIGHT 2004
+
 typedef enum {
     MODE_PROCESS = 0,
     MODE_TREE,
@@ -251,6 +267,69 @@ static void enable_raw_mode() {
     printf("\033[?25l"); 
 }
 
+// Read a single byte with timeout (helper for escape sequence parsing)
+static int read_byte_timeout(int timeout_ms) {
+    struct timeval tv;
+    tv.tv_sec = timeout_ms / 1000;
+    tv.tv_usec = (timeout_ms % 1000) * 1000;
+    
+    fd_set fds;
+    FD_ZERO(&fds);
+    FD_SET(STDIN_FILENO, &fds);
+    
+    if (select(STDIN_FILENO + 1, &fds, NULL, NULL, &tv) > 0) {
+        unsigned char c;
+        if (read(STDIN_FILENO, &c, 1) == 1) return c;
+    }
+    return -1;
+}
+
+// Parse escape sequences for function keys (htop-style F1-F10)
+static int parse_escape_sequence(void) {
+    int c1 = read_byte_timeout(50);  // 50ms timeout for escape sequences
+    if (c1 < 0) return 27;  // Just ESC key
+    
+    if (c1 == 'O') {
+        // ESC O x format (common for F1-F4)
+        int c2 = read_byte_timeout(50);
+        switch (c2) {
+            case 'P': return KEY_F1;
+            case 'Q': return KEY_F2;
+            case 'R': return KEY_F3;
+            case 'S': return KEY_F4;
+            default: return 27;
+        }
+    } else if (c1 == '[') {
+        // ESC [ ... format
+        int c2 = read_byte_timeout(50);
+        if (c2 == 'A') return KEY_UP;
+        if (c2 == 'B') return KEY_DOWN;
+        if (c2 == 'C') return KEY_RIGHT;
+        if (c2 == 'D') return KEY_LEFT;
+        
+        // ESC [ 1 x ~ format for F1-F4 (alternate)
+        // ESC [ 1 5 ~ for F5, etc.
+        if (c2 == '1') {
+            int c3 = read_byte_timeout(50);
+            if (c3 == '~') return KEY_F1;  // Some terminals
+            if (c3 == '1') { read_byte_timeout(50); return KEY_F1; }  // ESC [ 1 1 ~
+            if (c3 == '2') { read_byte_timeout(50); return KEY_F2; }
+            if (c3 == '3') { read_byte_timeout(50); return KEY_F3; }
+            if (c3 == '4') { read_byte_timeout(50); return KEY_F4; }
+            if (c3 == '5') { read_byte_timeout(50); return KEY_F5; }
+            if (c3 == '7') { read_byte_timeout(50); return KEY_F6; }
+            if (c3 == '8') { read_byte_timeout(50); return KEY_F7; }
+            if (c3 == '9') { read_byte_timeout(50); return KEY_F8; }
+        }
+        if (c2 == '2') {
+            int c3 = read_byte_timeout(50);
+            if (c3 == '0') { read_byte_timeout(50); return KEY_F9; }
+            if (c3 == '1') { read_byte_timeout(50); return KEY_F10; }
+        }
+    }
+    return 27;  // Unknown escape sequence, return ESC
+}
+
 static int wait_for_input(double seconds) {
     if (seconds < 0) seconds = 0;
     struct timeval tv;
@@ -266,7 +345,13 @@ static int wait_for_input(double seconds) {
     
     if (ret > 0) {
         unsigned char c;
-        if (read(STDIN_FILENO, &c, 1) == 1) return c;
+        if (read(STDIN_FILENO, &c, 1) == 1) {
+            // Check for escape sequence (function keys, arrows)
+            if (c == 27) {
+                return parse_escape_sequence();
+            }
+            return c;
+        }
     }
     return 0; // Timeout or error
 }
@@ -1550,26 +1635,26 @@ int main(int argc, char **argv) {
                         dirty = 1;
                     }
                     
+                    // Sorting keys - support both number keys (1-8) and function keys (F1-F8)
                     if (mode == MODE_PROCESS) {
-                        if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
-                        if (c == '2' || c == 0x02) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
-                        if (c == '3' || c == 0x03) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
-                        if (c == '4' || c == 0x04) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
-                        if (c == '5' || c == 0x05) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
-                        if (c == '6' || c == 0x06) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
-                        if (c == '7' || c == 0x07) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
-                    } else { // MODE_NETWORK
-                        if (c == '1' || c == 0x01) { sort_col_net = SORT_NET_RX; dirty = 1; }
-                        if (c == '2' || c == 0x02) { sort_col_net = SORT_NET_TX; dirty = 1; }
-                    }
-
-                    if (mode == MODE_STORAGE) {
-                        if (c == '1' || c == 0x01) { if (sort_col_disk == SORT_DISK_RIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RIO; sort_desc = 1; } dirty = 1; }
-                        if (c == '2' || c == 0x02) { if (sort_col_disk == SORT_DISK_WIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WIO; sort_desc = 1; } dirty = 1; }
-                        if (c == '3' || c == 0x03) { if (sort_col_disk == SORT_DISK_RMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RMIB; sort_desc = 1; } dirty = 1; }
-                        if (c == '4' || c == 0x04) { if (sort_col_disk == SORT_DISK_WMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WMIB; sort_desc = 1; } dirty = 1; }
-                        if (c == '5' || c == 0x05) { if (sort_col_disk == SORT_DISK_RLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RLAT; sort_desc = 1; } dirty = 1; }
-                        if (c == '6' || c == 0x06) { if (sort_col_disk == SORT_DISK_WLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WLAT; sort_desc = 1; } dirty = 1; }
+                        if (c == '1' || c == KEY_F1) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == KEY_F2) { if (sort_col_proc == SORT_CPU) sort_desc = !sort_desc; else { sort_col_proc = SORT_CPU; sort_desc = 1; } dirty = 1; }
+                        if (c == '3' || c == KEY_F3) { if (sort_col_proc == SORT_LOG_R) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_R; sort_desc = 1; } dirty = 1; }
+                        if (c == '4' || c == KEY_F4) { if (sort_col_proc == SORT_LOG_W) sort_desc = !sort_desc; else { sort_col_proc = SORT_LOG_W; sort_desc = 1; } dirty = 1; }
+                        if (c == '5' || c == KEY_F5) { if (sort_col_proc == SORT_WAIT) sort_desc = !sort_desc; else { sort_col_proc = SORT_WAIT; sort_desc = 1; } dirty = 1; }
+                        if (c == '6' || c == KEY_F6) { if (sort_col_proc == SORT_RMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_RMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '7' || c == KEY_F7) { if (sort_col_proc == SORT_WMIB) sort_desc = !sort_desc; else { sort_col_proc = SORT_WMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '8' || c == KEY_F8) { /* Reserved for State sorting */ dirty = 1; }
+                    } else if (mode == MODE_NETWORK) {
+                        if (c == '1' || c == KEY_F1) { if (sort_col_net == SORT_NET_RX) sort_desc = !sort_desc; else { sort_col_net = SORT_NET_RX; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == KEY_F2) { if (sort_col_net == SORT_NET_TX) sort_desc = !sort_desc; else { sort_col_net = SORT_NET_TX; sort_desc = 1; } dirty = 1; }
+                    } else if (mode == MODE_STORAGE) {
+                        if (c == '1' || c == KEY_F1) { if (sort_col_disk == SORT_DISK_RIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RIO; sort_desc = 1; } dirty = 1; }
+                        if (c == '2' || c == KEY_F2) { if (sort_col_disk == SORT_DISK_WIO) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WIO; sort_desc = 1; } dirty = 1; }
+                        if (c == '3' || c == KEY_F3) { if (sort_col_disk == SORT_DISK_RMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '4' || c == KEY_F4) { if (sort_col_disk == SORT_DISK_WMIB) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WMIB; sort_desc = 1; } dirty = 1; }
+                        if (c == '5' || c == KEY_F5) { if (sort_col_disk == SORT_DISK_RLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_RLAT; sort_desc = 1; } dirty = 1; }
+                        if (c == '6' || c == KEY_F6) { if (sort_col_disk == SORT_DISK_WLAT) sort_desc = !sort_desc; else { sort_col_disk = SORT_DISK_WLAT; sort_desc = 1; } dirty = 1; }
                     }
                 }
             }
