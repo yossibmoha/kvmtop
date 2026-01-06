@@ -1,0 +1,78 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build and Release
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc make musl-tools
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build kvmtop (glibc)
+        run: |
+          make clean || true
+          make VERSION=${{ steps.version.outputs.VERSION }}
+          mv build/kvmtop kvmtop-linux-amd64
+          
+      - name: Build kvmtop (musl static)
+        run: |
+          make clean
+          CC=musl-gcc CFLAGS="-Wall -Wextra -O2 -static" make VERSION=${{ steps.version.outputs.VERSION }}
+          mv build/kvmtop kvmtop-linux-amd64-static
+
+      - name: Generate checksums
+        run: |
+          sha256sum kvmtop-linux-amd64 kvmtop-linux-amd64-static > checksums.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: kvmtop ${{ steps.version.outputs.VERSION }}
+          body: |
+            ## kvmtop ${{ steps.version.outputs.VERSION }}
+            
+            ### Downloads
+            - `kvmtop-linux-amd64` - Dynamically linked (requires glibc)
+            - `kvmtop-linux-amd64-static` - Statically linked (portable, recommended)
+            
+            ### Installation
+            ```bash
+            # Download the static binary (portable)
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.VERSION }}/kvmtop-linux-amd64-static
+            chmod +x kvmtop-linux-amd64-static
+            sudo mv kvmtop-linux-amd64-static /usr/local/bin/kvmtop
+            ```
+            
+            ### Verify checksums
+            ```bash
+            sha256sum -c checksums.txt
+            ```
+          files: |
+            kvmtop-linux-amd64
+            kvmtop-linux-amd64-static
+            checksums.txt
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
