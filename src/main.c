@@ -28,11 +28,26 @@
 #define KVM_VERSION "v1.0.1-dev"
 #endif
 
+// ANSI Color Codes
+#define COLOR_RESET   "\033[0m"
+#define COLOR_RED     "\033[31m"
+#define COLOR_YELLOW  "\033[33m"
+#define COLOR_GREEN   "\033[32m"
+#define COLOR_CYAN    "\033[36m"
+#define COLOR_BOLD    "\033[1m"
+
+// Thresholds for color coding
+#define THRESH_CPU_WARN  80.0
+#define THRESH_CPU_CRIT  95.0
+#define THRESH_WAIT_WARN 500.0
+#define THRESH_WAIT_CRIT 1000.0
+
 typedef enum {
     MODE_PROCESS = 0,
     MODE_TREE,
     MODE_NETWORK,
-    MODE_STORAGE
+    MODE_STORAGE,
+    MODE_HELP
 } display_mode_t;
 
 // --- Data Structures ---
@@ -48,6 +63,8 @@ typedef struct {
     uint64_t cpu_jiffies;
     uint64_t blkio_ticks;
     uint64_t start_time_ticks;
+    uint64_t minflt;  // Minor page faults
+    uint64_t majflt;  // Major page faults
     
     char state;
     char user[32];
@@ -62,6 +79,8 @@ typedef struct {
     double io_wait_ms;
     double r_mib;
     double w_mib;
+    double minflt_ps;  // Minor faults per second
+    double majflt_ps;  // Major faults per second
 
     char cmd[CMD_MAX];
 } sample_t;
@@ -74,6 +93,8 @@ typedef struct {
     unsigned long long wsect;
     unsigned long long ruse; // Time spent reading (ms)
     unsigned long long wuse; // Time spent writing (ms)
+    unsigned long long io_ticks; // Time spent doing I/O (ms)
+    unsigned long long inflight; // I/O currently in progress
     
     double r_iops;
     double w_iops;
@@ -81,6 +102,8 @@ typedef struct {
     double w_mib;
     double r_lat; // ms
     double w_lat; // ms
+    double util_pct; // Disk utilization percentage
+    int queue_depth; // Queue depth from sysfs
 } disk_sample_t;
 
 typedef struct {
@@ -265,6 +288,86 @@ static void fprint_trunc(FILE *out, const char *s, int width) {
     else fprintf(out, "%.*s...", width - 3, s);
 }
 
+// Color helper functions
+static int color_enabled = 1;  // Global flag for color support
+
+static const char* get_cpu_color(double cpu_pct) {
+    if (!color_enabled) return "";
+    if (cpu_pct >= THRESH_CPU_CRIT) return COLOR_RED;
+    if (cpu_pct >= THRESH_CPU_WARN) return COLOR_YELLOW;
+    return COLOR_GREEN;
+}
+
+static const char* get_wait_color(double wait_ms) {
+    if (!color_enabled) return "";
+    if (wait_ms >= THRESH_WAIT_CRIT) return COLOR_RED;
+    if (wait_ms >= THRESH_WAIT_WARN) return COLOR_YELLOW;
+    return "";
+}
+
+static const char* get_state_color(char state) {
+    if (!color_enabled) return "";
+    if (state == 'D') return COLOR_RED;  // Disk wait
+    if (state == 'Z') return COLOR_YELLOW;  // Zombie
+    return "";
+}
+
+static const char* reset_color(void) {
+    return color_enabled ? COLOR_RESET : "";
+}
+
+static void print_help_screen(void) {
+    printf("\033[2J\033[H");
+    printf("╔═══════════════════════════════════════════════════════════════════════════╗\n");
+    printf("║                          kvmtop %s - Help                              ║\n", KVM_VERSION);
+    printf("╚═══════════════════════════════════════════════════════════════════════════╝\n\n");
+    
+    printf("  VIEW CONTROLS:\n");
+    printf("    c       - Switch to Process/CPU view (main dashboard)\n");
+    printf("    s       - Switch to Storage/Disk view\n");
+    printf("    n       - Switch to Network view\n");
+    printf("    t       - Toggle Tree mode (show threads in process view)\n");
+    printf("    h       - Show this help screen\n\n");
+    
+    printf("  INTERACTIVE CONTROLS:\n");
+    printf("    f       - Freeze/Resume display updates\n");
+    printf("    l       - Set display limit (number of entries to show)\n");
+    printf("    r       - Set refresh interval in seconds\n");
+    printf("    /       - Enter filter mode (search by PID, name, user, VM)\n");
+    printf("    q       - Quit kvmtop\n\n");
+    
+    printf("  SORTING (Process View):\n");
+    printf("    1       - Sort by PID\n");
+    printf("    2       - Sort by CPU%%\n");
+    printf("    3       - Sort by Read Logs (logical IOPS)\n");
+    printf("    4       - Sort by Write Logs (logical IOPS)\n");
+    printf("    5       - Sort by IO Wait (latency)\n");
+    printf("    6       - Sort by Read Bandwidth (MiB/s)\n");
+    printf("    7       - Sort by Write Bandwidth (MiB/s)\n");
+    printf("    8       - Sort by State\n\n");
+    
+    printf("  SORTING (Network View):\n");
+    printf("    1       - Sort by RX (Receive Mbps)\n");
+    printf("    2       - Sort by TX (Transmit Mbps)\n\n");
+    
+    printf("  SORTING (Storage View):\n");
+    printf("    1       - Sort by Read IOPS\n");
+    printf("    2       - Sort by Write IOPS\n");
+    printf("    3       - Sort by Read MiB/s\n");
+    printf("    4       - Sort by Write MiB/s\n");
+    printf("    5       - Sort by Read Latency\n");
+    printf("    6       - Sort by Write Latency\n\n");
+    
+    printf("  COMMAND-LINE OPTIONS:\n");
+    printf("    -i, --interval <sec>   Set refresh interval (default: 5.0)\n");
+    printf("    -p, --pid <PID>        Monitor specific process ID(s)\n");
+    printf("    -v, --version          Show version information\n");
+    printf("    -h, --help             Show help message\n\n");
+    
+    printf("  Press any key to return...");
+    fflush(stdout);
+}
+
 // --- File Reading Helpers ---
 
 static int read_small_file(const char *path, char *buf, size_t buflen, ssize_t *nread_out) {
@@ -351,7 +454,7 @@ static int read_io_file(const char *path, uint64_t *syscr, uint64_t *syscw, uint
     return 0;
 }
 
-static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out, char *state_out, uint64_t *start_time_out) {
+static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, uint64_t *blkio_ticks_out, char *state_out, uint64_t *start_time_out, uint64_t *minflt_out, uint64_t *majflt_out) {
     char buf[4096]; ssize_t n = 0;
     if (read_small_file(path, buf, sizeof(buf), &n) != 0 || n <= 0) return -1;
     
@@ -366,9 +469,13 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     uint64_t utime=0, stime=0;
     *blkio_ticks_out = 0;
     *start_time_out = 0;
+    *minflt_out = 0;
+    *majflt_out = 0;
     
     while (tok) {
-        if (idx == 11) utime = strtoull(tok, NULL, 10); 
+        if (idx == 7) *minflt_out = strtoull(tok, NULL, 10);  // Field 10 in /proc/[pid]/stat
+        else if (idx == 9) *majflt_out = strtoull(tok, NULL, 10);  // Field 12
+        else if (idx == 11) utime = strtoull(tok, NULL, 10); 
         else if (idx == 12) stime = strtoull(tok, NULL, 10);
         else if (idx == 19) *start_time_out = strtoull(tok, NULL, 10);
         else if (idx == 39) { 
@@ -482,10 +589,12 @@ static int collect_disks(vec_disk_t *out) {
         char name[64];
         unsigned long long rio, rmerge, rsect, ruse;
         unsigned long long wio, wmerge, wsect, wuse;
-        if (sscanf(line, "%d %d %s %llu %llu %llu %llu %llu %llu %llu %llu",
+        unsigned long long inflight, io_ticks, time_in_queue;
+        if (sscanf(line, "%d %d %s %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu %llu",
                    &major, &minor, name,
                    &rio, &rmerge, &rsect, &ruse,
-                   &wio, &wmerge, &wsect, &wuse) == 11) {
+                   &wio, &wmerge, &wsect, &wuse,
+                   &inflight, &io_ticks, &time_in_queue) >= 11) {
             if (strncmp(name, "loop", 4) == 0 || strncmp(name, "ram", 3) == 0) continue;
             
             disk_sample_t ds; memset(&ds, 0, sizeof(ds));
@@ -493,6 +602,20 @@ static int collect_disks(vec_disk_t *out) {
             ds.rio = rio; ds.wio = wio;
             ds.rsect = rsect; ds.wsect = wsect;
             ds.ruse = ruse; ds.wuse = wuse;
+            ds.inflight = inflight;
+            ds.io_ticks = io_ticks;
+            
+            // Read queue depth from sysfs
+            char sysfs_path[256];
+            snprintf(sysfs_path, sizeof(sysfs_path), "/sys/block/%s/queue/nr_requests", name);
+            FILE *qf = fopen(sysfs_path, "r");
+            if (qf) {
+                if (fscanf(qf, "%d", &ds.queue_depth) != 1) ds.queue_depth = 0;
+                fclose(qf);
+            } else {
+                ds.queue_depth = 0;
+            }
+            
             vec_disk_push(out, &ds);
         }
     }
@@ -639,7 +762,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
                 snprintf(stat_path, sizeof(stat_path), "/proc/%d/task/%d/stat", pid, tid);
                 
                 read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks);
+                read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks, &s.minflt, &s.majflt);
                 read_statm(tid, &s.mem_virt_pages, &s.mem_res_pages, &s.mem_shr_pages);
                 get_proc_user(pid, s.user, sizeof(s.user));
 
@@ -659,7 +782,7 @@ static int collect_samples(vec_t *out, const pid_t *filter_pids, size_t filter_n
             snprintf(stat_path, sizeof(stat_path), "/proc/%d/stat", pid);
             
             read_io_file(io_path, &s.syscr, &s.syscw, &s.read_bytes, &s.write_bytes);
-            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks);
+            read_proc_stat_fields(stat_path, &s.cpu_jiffies, &s.blkio_ticks, &s.state, &s.start_time_ticks, &s.minflt, &s.majflt);
             read_statm(pid, &s.mem_virt_pages, &s.mem_res_pages, &s.mem_shr_pages);
             get_proc_user(pid, s.user, sizeof(s.user));
 
@@ -872,11 +995,12 @@ int main(int argc, char **argv) {
         {"interval", required_argument, NULL, 'i'},
         {"pid", required_argument, NULL, 'p'},
         {"help", no_argument, NULL, 'h'},
+        {"version", no_argument, NULL, 'v'},
         {0, 0, 0, 0}
     };
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "i:p:h", long_opts, NULL)) != -1) {
+    while ((opt = getopt_long(argc, argv, "i:p:hv", long_opts, NULL)) != -1) {
         switch (opt) {
             case 'i': interval = strtod(optarg, NULL); if (interval <= 0) return 2; break;
             case 'p': {
@@ -888,6 +1012,9 @@ int main(int argc, char **argv) {
                 filter[filter_n++] = (pid_t)v;
                 break;
             }
+            case 'v':
+                printf("kvmtop %s\n", KVM_VERSION);
+                return 0;
             case 'h': default: return 0;
         }
     }
@@ -962,7 +1089,7 @@ int main(int argc, char **argv) {
             for (size_t i=0; i<curr_raw.len; i++) {
                 sample_t *c = &curr_raw.data[i];
                 const sample_t *p = find_prev(&prev, c->key);
-                uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0, d_blk=0;
+                uint64_t d_cpu=0, d_scr=0, d_scw=0, d_rb=0, d_wb=0, d_blk=0, d_minflt=0, d_majflt=0;
                 if (p) {
                     d_cpu = (c->cpu_jiffies >= p->cpu_jiffies) ? c->cpu_jiffies - p->cpu_jiffies : 0;
                     d_scr = (c->syscr >= p->syscr) ? c->syscr - p->syscr : 0;
@@ -970,13 +1097,17 @@ int main(int argc, char **argv) {
                     d_rb  = (c->read_bytes >= p->read_bytes) ? c->read_bytes - p->read_bytes : 0;
                     d_wb  = (c->write_bytes >= p->write_bytes) ? c->write_bytes - p->write_bytes : 0;
                     d_blk = (c->blkio_ticks >= p->blkio_ticks) ? c->blkio_ticks - p->blkio_ticks : 0;
+                    d_minflt = (c->minflt >= p->minflt) ? c->minflt - p->minflt : 0;
+                    d_majflt = (c->majflt >= p->majflt) ? c->majflt - p->majflt : 0;
                 }
                 c->cpu_pct = ((double)d_cpu * 100.0) / (dt * (double)hz);
                 c->r_iops = (double)d_scr / dt;
                 c->w_iops = (double)d_scw / dt;
                 c->r_mib  = ((double)d_rb / dt) / 1048576.0;
                 c->w_mib  = ((double)d_wb / dt) / 1048576.0;
-                c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
+                c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz;
+                c->minflt_ps = (double)d_minflt / dt;
+                c->majflt_ps = (double)d_majflt / dt;
             }
 
             // Net Metrics
@@ -1023,6 +1154,7 @@ int main(int argc, char **argv) {
                     uint64_t dws  = (cd->wsect >= pd->wsect) ? cd->wsect - pd->wsect : 0;
                     uint64_t dt_r = (cd->ruse >= pd->ruse) ? cd->ruse - pd->ruse : 0;
                     uint64_t dt_w = (cd->wuse >= pd->wuse) ? cd->wuse - pd->wuse : 0;
+                    uint64_t d_io_ticks = (cd->io_ticks >= pd->io_ticks) ? cd->io_ticks - pd->io_ticks : 0;
                     
                     cd->r_iops = (double)drio / dt;
                     cd->w_iops = (double)dwio / dt;
@@ -1031,6 +1163,10 @@ int main(int argc, char **argv) {
                     
                     if (drio > 0) cd->r_lat = (double)dt_r / (double)drio; else cd->r_lat = 0;
                     if (dwio > 0) cd->w_lat = (double)dt_w / (double)dwio; else cd->w_lat = 0;
+                    
+                    // Calculate utilization percentage
+                    cd->util_pct = ((double)d_io_ticks / (dt * 1000.0)) * 100.0;
+                    if (cd->util_pct > 100.0) cd->util_pct = 100.0;
                 }
             }
 
@@ -1097,8 +1233,8 @@ int main(int argc, char **argv) {
 
                     int namew=16, statw=10, ratew=12, pktw=10, errw=8;
                     char h_rx[32], h_tx[32];
-                    snprintf(h_rx, 32, "[1] %s", "RX_Mbps");
-                    snprintf(h_tx, 32, "[2] %s", "TX_Mbps");
+                    snprintf(h_rx, 32, "[1] RX_Mbps%s", sort_col_net == SORT_NET_RX ? "*" : "");
+                    snprintf(h_tx, 32, "[2] TX_Mbps%s", sort_col_net == SORT_NET_TX ? "*" : "");
 
                     printf("%*s %*s %*s %*s %*s %*s %*s %*s %-6s %s\n",
                         namew, "IFACE", statw, "STATE", 
@@ -1145,12 +1281,12 @@ int main(int argc, char **argv) {
 
                     int devw=16, iopsw=12, mibw=12, latw=12;
                     char h_ri[32], h_wi[32], h_rm[32], h_wm[32], h_rl[32], h_wl[32];
-                    snprintf(h_ri, 32, "[1] R_IOPS");
-                    snprintf(h_wi, 32, "[2] W_IOPS");
-                    snprintf(h_rm, 32, "[3] R_MiB/s");
-                    snprintf(h_wm, 32, "[4] W_MiB/s");
-                    snprintf(h_rl, 32, "[5] R_Lat(ms)");
-                    snprintf(h_wl, 32, "[6] W_Lat(ms)");
+                    snprintf(h_ri, 32, "[1] R_IOPS%s", sort_col_disk == SORT_DISK_RIO ? "*" : "");
+                    snprintf(h_wi, 32, "[2] W_IOPS%s", sort_col_disk == SORT_DISK_WIO ? "*" : "");
+                    snprintf(h_rm, 32, "[3] R_MiB/s%s", sort_col_disk == SORT_DISK_RMIB ? "*" : "");
+                    snprintf(h_wm, 32, "[4] W_MiB/s%s", sort_col_disk == SORT_DISK_WMIB ? "*" : "");
+                    snprintf(h_rl, 32, "[5] R_Lat(ms)%s", sort_col_disk == SORT_DISK_RLAT ? "*" : "");
+                    snprintf(h_wl, 32, "[6] W_Lat(ms)%s", sort_col_disk == SORT_DISK_WLAT ? "*" : "");
 
                     printf("%*s %*s %*s %*s %*s %*s %*s\n",
                         devw, "DEVICE", iopsw, h_ri, iopsw, h_wi, mibw, h_rm, mibw, h_wm, latw, h_rl, latw, h_wl);
@@ -1200,19 +1336,28 @@ int main(int argc, char **argv) {
                     int cmdw = cols - fixed_width; 
                     if (cmdw < 10) cmdw = 10;
 
+                    char h_pid[16], h_cpu[16], h_rlog[16], h_wlog[16], h_wait[16], h_rmib[16], h_wmib[16];
+                    snprintf(h_pid, 16, "[1] PID%s", sort_col_proc == SORT_PID ? "*" : "");
+                    snprintf(h_cpu, 16, "[2] CPU%%%s", sort_col_proc == SORT_CPU ? "*" : "");
+                    snprintf(h_rlog, 16, "[3] R_Log%s", sort_col_proc == SORT_LOG_R ? "*" : "");
+                    snprintf(h_wlog, 16, "[4] W_Log%s", sort_col_proc == SORT_LOG_W ? "*" : "");
+                    snprintf(h_wait, 16, "[5] Wait%s", sort_col_proc == SORT_WAIT ? "*" : "");
+                    snprintf(h_rmib, 16, "[6] R_MiB%s", sort_col_proc == SORT_RMIB ? "*" : "");
+                    snprintf(h_wmib, 16, "[7] W_MiB%s", sort_col_proc == SORT_WMIB ? "*" : "");
+
                     printf("%*s %-*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
-                        pidw, "[1] PID",
+                        pidw, h_pid,
                         userw, "User",
                         uptimew, "Uptime",
                         memw, "Res(MiB)",
                         memw, "Shr(MiB)",
                         memw, "Virt(MiB)",
-                        iopsw, "[3] R_Log",
-                        iopsw, "[4] W_Log",
-                        waitw, "[5] Wait",
-                        mibw, "[6] R_MiB",
-                        mibw, "[7] W_MiB",
-                        cpuw, "[2] CPU%",
+                        iopsw, h_rlog,
+                        iopsw, h_wlog,
+                        waitw, h_wait,
+                        mibw, h_rmib,
+                        mibw, h_wmib,
+                        cpuw, h_cpu,
                         statew, "[8] S",
                         "COMMAND"
                     );
@@ -1399,6 +1544,11 @@ int main(int argc, char **argv) {
                     if (c == 'n' || c == 'N') { mode = MODE_NETWORK; dirty = 1; }
                     if (c == 'c' || c == 'C') { mode = MODE_PROCESS; dirty = 1; }
                     if (c == 's' || c == 'S') { mode = MODE_STORAGE; dirty = 1; }
+                    if (c == 'h' || c == 'H') {
+                        print_help_screen();
+                        wait_for_input(999999);  // Wait for any key
+                        dirty = 1;
+                    }
                     
                     if (mode == MODE_PROCESS) {
                         if (c == '1' || c == 0x01) { if (sort_col_proc == SORT_PID) sort_desc = !sort_desc; else { sort_col_proc = SORT_PID; sort_desc = 1; } dirty = 1; }
