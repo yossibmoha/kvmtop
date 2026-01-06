@@ -65,9 +65,13 @@ Switch between different monitoring views:
 
 ### Sorting (htop-style)
 
-kvmtop supports htop-style sorting using **function keys (F1-F8)** or **number keys (1-8)**:
+kvmtop supports htop-style sorting using:
 
-> **Tip:** Press the same key twice to toggle between ascending and descending order. The sort indicator (`v` or `^`) shows current direction.
+- **Function keys (F1-F8)**
+- **Number keys (1-8)**
+- **Mouse clicks on column headers** 🖱️
+
+> **Tip:** Press the same key twice (or click the same header twice) to toggle between ascending and descending order. The sort indicator (`*`) shows the active sort column.
 
 ### Sorting - Process View
 

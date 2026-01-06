@@ -80,7 +80,7 @@ Complete documentation is available in the [`docs/`](docs/) folder:
 | `r` | Set refresh interval |
 | `q` | Quit |
 
-**Sorting:** Use `F1-F8` (htop-style) or `1-8` keys. Press same key to toggle sort direction. Press `h` for complete shortcuts.
+**Sorting:** Use `F1-F8` (htop-style), `1-8` keys, or **click column headers with mouse** 🖱️. Press same key/click again to toggle sort direction. Press `h` for complete shortcuts.
 
 ## 🔧 Examples
 

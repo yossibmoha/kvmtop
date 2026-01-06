@@ -58,6 +58,15 @@
 #define KEY_LEFT  2003
 #define KEY_RIGHT 2004
 
+// Mouse event structure
+typedef struct {
+    int button;  // 0=left, 1=middle, 2=right, 3=release, 64=scroll up, 65=scroll down
+    int x;       // Column (1-based)
+    int y;       // Row (1-based)
+} mouse_event_t;
+
+#define KEY_MOUSE 3000  // Special code indicating mouse event
+
 typedef enum {
     MODE_PROCESS = 0,
     MODE_TREE,
@@ -247,12 +256,17 @@ static double now_monotonic(void) {
 // --- Terminal Handling ---
 static struct termios orig_termios;
 static int raw_mode_enabled = 0;
+static mouse_event_t last_mouse_event = {0, 0, 0};  // Store last mouse event
 
 static void disable_raw_mode() {
     if (raw_mode_enabled) {
+        // Disable mouse tracking
+        printf("\033[?1000l");  // Disable mouse click tracking
+        printf("\033[?1006l");  // Disable SGR mouse mode
+        printf("\033[?25h");    // Show cursor
+        fflush(stdout);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
         raw_mode_enabled = 0;
-        printf("\033[?25h"); 
     }
 }
 
@@ -264,7 +278,10 @@ static void enable_raw_mode() {
     raw.c_lflag &= ~(ECHO | ICANON);
     tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw);
     raw_mode_enabled = 1;
-    printf("\033[?25l"); 
+    printf("\033[?25l");       // Hide cursor
+    printf("\033[?1000h");     // Enable mouse click tracking
+    printf("\033[?1006h");     // Enable SGR extended mouse mode (better coordinates)
+    fflush(stdout); 
 }
 
 // Read a single byte with timeout (helper for escape sequence parsing)
@@ -284,7 +301,38 @@ static int read_byte_timeout(int timeout_ms) {
     return -1;
 }
 
-// Parse escape sequences for function keys (htop-style F1-F10)
+// Parse mouse SGR extended mode: ESC [ < Cb ; Cx ; Cy M/m
+static int parse_mouse_sgr(void) {
+    char buf[32];
+    int i = 0;
+    int c;
+    
+    // Read until we get 'M' (press) or 'm' (release)
+    while (i < 30) {
+        c = read_byte_timeout(50);
+        if (c < 0) return 27;
+        if (c == 'M' || c == 'm') {
+            buf[i] = '\0';
+            break;
+        }
+        buf[i++] = (char)c;
+    }
+    
+    // Parse: button;x;y
+    int button = 0, x = 0, y = 0;
+    if (sscanf(buf, "%d;%d;%d", &button, &x, &y) == 3) {
+        // Only handle left click (button 0) press events (ending in 'M')
+        if (c == 'M' && (button & 3) == 0) {
+            last_mouse_event.button = button & 3;
+            last_mouse_event.x = x;
+            last_mouse_event.y = y;
+            return KEY_MOUSE;
+        }
+    }
+    return 0;  // Ignore other mouse events
+}
+
+// Parse escape sequences for function keys (htop-style F1-F10) and mouse
 static int parse_escape_sequence(void) {
     int c1 = read_byte_timeout(50);  // 50ms timeout for escape sequences
     if (c1 < 0) return 27;  // Just ESC key
@@ -306,6 +354,11 @@ static int parse_escape_sequence(void) {
         if (c2 == 'B') return KEY_DOWN;
         if (c2 == 'C') return KEY_RIGHT;
         if (c2 == 'D') return KEY_LEFT;
+        
+        // Mouse SGR extended mode: ESC [ <
+        if (c2 == '<') {
+            return parse_mouse_sgr();
+        }
         
         // ESC [ 1 x ~ format for F1-F4 (alternate)
         // ESC [ 1 5 ~ for F5, etc.
@@ -480,6 +533,44 @@ static void print_footer_bar(display_mode_t mode, int frozen, int cols) {
     printf("\033[0m");
 }
 
+// Handle mouse click on header row - returns sort key or 0
+// Header row is row 3 (after title and system stats)
+static int handle_header_click(int x, int y, display_mode_t mode) {
+    // Header row is line 3
+    if (y != 3) return 0;
+    
+    if (mode == MODE_PROCESS || mode == MODE_TREE) {
+        // Column positions for process view (approximate)
+        // PID: 1-10, User: 11-21, Uptime: 22-32, Res: 33-43, Shr: 44-54, Virt: 55-65
+        // R_Log: 66-76, W_Log: 77-87, Wait: 88-96, R_MiB: 97-107, W_MiB: 108-118
+        // CPU%: 119-127, State: 128-133
+        if (x >= 1 && x <= 10) return KEY_F1;    // PID
+        if (x >= 66 && x <= 76) return KEY_F3;   // R_Log
+        if (x >= 77 && x <= 87) return KEY_F4;   // W_Log
+        if (x >= 88 && x <= 96) return KEY_F5;   // Wait
+        if (x >= 97 && x <= 107) return KEY_F6;  // R_MiB
+        if (x >= 108 && x <= 118) return KEY_F7; // W_MiB
+        if (x >= 119 && x <= 127) return KEY_F2; // CPU%
+        if (x >= 128 && x <= 133) return KEY_F8; // State
+    } else if (mode == MODE_NETWORK) {
+        // Network view columns
+        // IFACE: 1-16, STATE: 17-27, RX_Mbps: 28-40, TX_Mbps: 41-53
+        if (x >= 28 && x <= 40) return KEY_F1;   // RX
+        if (x >= 41 && x <= 53) return KEY_F2;   // TX
+    } else if (mode == MODE_STORAGE) {
+        // Storage view columns
+        // DEVICE: 1-16, R_IOPS: 17-28, W_IOPS: 29-40, R_MiB/s: 41-52
+        // W_MiB/s: 53-64, R_Lat: 65-78, W_Lat: 79-92
+        if (x >= 17 && x <= 28) return KEY_F1;   // R_IOPS
+        if (x >= 29 && x <= 40) return KEY_F2;   // W_IOPS
+        if (x >= 41 && x <= 52) return KEY_F3;   // R_MiB/s
+        if (x >= 53 && x <= 64) return KEY_F4;   // W_MiB/s
+        if (x >= 65 && x <= 78) return KEY_F5;   // R_Lat
+        if (x >= 79 && x <= 92) return KEY_F6;   // W_Lat
+    }
+    return 0;
+}
+
 // Export current view to CSV
 static void export_csv(const char *mode_name, vec_t *proc_data, vec_net_t *net_data, vec_disk_t *disk_data, display_mode_t mode) {
     char filename[128];
@@ -590,8 +681,8 @@ static void print_help_screen(void) {
     printf("    /       - Enter filter mode (search by PID, name, user, VM)\n");
     printf("    q       - Quit kvmtop\n\n");
     
-    printf("  SORTING (htop-style: use F1-F8 or number keys 1-8):\n");
-    printf("    Press same key again to toggle ascending/descending order\n\n");
+    printf("  SORTING (htop-style: use F1-F8, number keys 1-8, or CLICK COLUMN HEADERS):\n");
+    printf("    Press same key/click again to toggle ascending/descending order\n\n");
     
     printf("    Process View:     Network View:     Storage View:\n");
     printf("    F1/1 - PID        F1/1 - RX Mbps    F1/1 - Read IOPS\n");
@@ -1816,6 +1907,14 @@ int main(int argc, char **argv) {
                         print_help_screen();
                         wait_for_input(999999);  // Wait for any key
                         dirty = 1;
+                    }
+                    
+                    // Handle mouse clicks on header row
+                    if (c == KEY_MOUSE) {
+                        int sort_key = handle_header_click(last_mouse_event.x, last_mouse_event.y, mode);
+                        if (sort_key > 0) {
+                            c = sort_key;  // Convert mouse click to sort key
+                        }
                     }
                     
                     // Sorting keys - support both number keys (1-8) and function keys (F1-F8)
