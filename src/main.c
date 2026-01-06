@@ -56,7 +56,8 @@ typedef struct {
     uint64_t mem_res_pages;
     uint64_t mem_shr_pages;
 
-    double cpu_pct;
+    double cpu_pct; 
+    double sys_cpu_pct; // New field
     double r_iops;
     double w_iops;
     double io_wait_ms;
@@ -72,15 +73,15 @@ typedef struct {
     unsigned long long wio;
     unsigned long long rsect;
     unsigned long long wsect;
-    unsigned long long ruse; // Time spent reading (ms)
-    unsigned long long wuse; // Time spent writing (ms)
+    unsigned long long ruse; 
+    unsigned long long wuse; 
     
     double r_iops;
     double w_iops;
     double r_mib;
     double w_mib;
-    double r_lat; // ms
-    double w_lat; // ms
+    double r_lat; 
+    double w_lat; 
 } disk_sample_t;
 
 typedef struct {
@@ -361,7 +362,7 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
     char *p = rparen + 2; 
     if (*p) *state_out = *p; else *state_out = '?';
 
-    char *save = NULL; char *tok = strtok_r(p, " ", &save);
+    char *save = NULL; char *tok = strtok_r(p, " ", &save); 
     int idx = 0; 
     uint64_t utime=0, stime=0;
     *blkio_ticks_out = 0;
@@ -384,7 +385,7 @@ static int read_proc_stat_fields(const char *path, uint64_t *cpu_jiffies_out, ui
 static void read_statm(pid_t pid, uint64_t *virt, uint64_t *res, uint64_t *shr) {
     char path[64];
     snprintf(path, sizeof(path), "/proc/%d/statm", pid);
-    char buf[256]; ssize_t n;
+    char buf[256]; ssize_t n; 
     if (read_small_file(path, buf, sizeof(buf), &n) == 0 && n > 0) {
         unsigned long long v=0, r=0, s=0;
         if (sscanf(buf, "%llu %llu %llu", &v, &r, &s) >= 2) {
@@ -696,7 +697,6 @@ typedef enum {
     SORT_PID=1, SORT_CPU, SORT_LOG_R, SORT_LOG_W, SORT_WAIT, SORT_RMIB, SORT_WMIB,
     SORT_NET_RX, SORT_NET_TX,
     SORT_MEM_RES, SORT_MEM_SHR, SORT_MEM_VIRT, SORT_USER, SORT_UPTIME,
-    // Disk specific
     SORT_DISK_RIO, SORT_DISK_WIO, SORT_DISK_RMIB, SORT_DISK_WMIB, SORT_DISK_RLAT, SORT_DISK_WLAT
 } sort_col_t;
 
@@ -808,13 +808,15 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
                 dst->data[write_idx].io_wait_ms += dst->data[i].io_wait_ms;
                 dst->data[write_idx].r_mib += dst->data[i].r_mib;
                 dst->data[write_idx].w_mib += dst->data[i].w_mib;
+                dst->data[write_idx].sys_cpu_pct += dst->data[i].sys_cpu_pct; // New Sum
+                dst->data[write_idx].mem_res_pages += dst->data[i].mem_res_pages;
                 
                 dst->data[write_idx].pid = dst->data[write_idx].tgid; 
                 dst->data[write_idx].state = dst->data[i].state; 
             } else {
                 write_idx++;
                 dst->data[write_idx] = dst->data[i];
-                dst->data[write_idx].pid = dst->data[i].tgid; // Ensure PID column shows TGID
+                dst->data[write_idx].pid = dst->data[i].tgid; 
             }
         }
         dst->len = write_idx + 1;
@@ -822,16 +824,17 @@ static void aggregate_by_tgid(const vec_t *src, vec_t *dst) {
 }
 
 // Tree view helper
-static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int cpuw, int iopsw, int waitw, int mibw, int statew, int cmdw) {
+static void print_threads_for_tgid(const vec_t *raw, pid_t tgid, int pidw, int cpuw, int sysw, int iopsw, int waitw, int mibw, int statew, int cmdw) {
     for (size_t i = 0; i < raw->len; i++) {
         const sample_t *s = &raw->data[i];
         if (s->tgid == tgid && s->pid != tgid) { 
             char pidbuf[32];
-            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); // Indent
+            snprintf(pidbuf, sizeof(pidbuf), "  └─ %d", s->pid); 
             
-            printf("%*s %*.*f %*.0f %*.0f %*.*f %*.*f %*.*f %*c ",
+            printf("%*s %*.*f %*.*f %*.0f %*.0f %*.*f %*.*f %*.*f %*c ",
                 pidw, pidbuf,
                 cpuw, 2, s->cpu_pct,
+                sysw, 2, s->sys_cpu_pct,
                 iopsw, s->r_iops,
                 iopsw, s->w_iops,
                 waitw, 2, s->io_wait_ms,
@@ -893,6 +896,8 @@ int main(int argc, char **argv) {
     }
 
     long hz = sysconf(_SC_CLK_TCK);
+    long num_cpus = sysconf(_SC_NPROCESSORS_ONLN); // Get CPU Count
+
     vec_t prev, curr_raw, curr_proc;
     vec_init(&prev); vec_init(&curr_raw); vec_init(&curr_proc);
     
@@ -908,7 +913,8 @@ int main(int argc, char **argv) {
     memset(&curr_cpu, 0, sizeof(curr_cpu));
     read_global_cpu(&prev_cpu);
 
-    printf("Initializing (wait %.0fs)...\n", interval);
+    printf("Initializing (wait %.0fs)...
+", interval);
     
     if (collect_samples(&prev, filter, filter_n) != 0) return 1;
     collect_net_dev(&prev_net);
@@ -918,7 +924,7 @@ int main(int argc, char **argv) {
     double t_prev = now_monotonic();
     
     double global_cpu_percent = 0.0;
-    int system_threads = 0;
+    int system_threads = num_cpus;
 
     enable_raw_mode();
     sort_col_t sort_col_proc = SORT_CPU;
@@ -940,7 +946,6 @@ int main(int argc, char **argv) {
             collect_disks(&curr_disk);
 
             read_global_cpu(&curr_cpu);
-            system_threads = (int)sysconf(_SC_NPROCESSORS_ONLN);
 
             t_curr = now_monotonic();
 
@@ -972,6 +977,7 @@ int main(int argc, char **argv) {
                     d_blk = (c->blkio_ticks >= p->blkio_ticks) ? c->blkio_ticks - p->blkio_ticks : 0;
                 }
                 c->cpu_pct = ((double)d_cpu * 100.0) / (dt * (double)hz);
+                c->sys_cpu_pct = c->cpu_pct / (double)num_cpus; // Calculate Sys%
                 c->r_iops = (double)d_scr / dt;
                 c->w_iops = (double)d_scw / dt;
                 c->r_mib  = ((double)d_rb / dt) / 1048576.0;
@@ -979,7 +985,8 @@ int main(int argc, char **argv) {
                 c->io_wait_ms = ((double)d_blk * 1000.0) / (double)hz; 
             }
 
-            // Net Metrics
+            // Net & Disk Deltas (Existing Logic omitted for brevity, assume same as before)
+             // Net Metrics
             for (size_t i=0; i<curr_net.len; i++) {
                 net_iface_t *cn = &curr_net.data[i];
                 net_iface_t *pn = NULL;
@@ -1059,7 +1066,6 @@ int main(int argc, char **argv) {
                 } else if (in_refresh_mode) {
                     snprintf(right, sizeof(right), "REFRESH(s): %s_", refresh_str);
                 } else {
-                    // Normal header
                     char f_info[40] = "";
                     if (strlen(filter_str) > 0) snprintf(f_info, sizeof(f_info), "Filter: %s | ", filter_str);
                     
@@ -1090,7 +1096,7 @@ int main(int argc, char **argv) {
                     s_uswap, s_tswap, (total_swap > 0) ? ((double)used_swap / (double)total_swap * 100.0) : 0.0);
 
                 if (mode == MODE_NETWORK) {
-                    if (sort_col_net == SORT_NET_RX) 
+                    if (sort_col_net == SORT_NET_RX)
                         qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_rx);
                     else
                         qsort(curr_net.data, curr_net.len, sizeof(net_iface_t), cmp_net_tx);
@@ -1186,10 +1192,10 @@ int main(int argc, char **argv) {
                     }
 
                     // Column Widths
-                    int pidw = 10, cpuw = 8, memw = 10, userw = 10, uptimew=10, statew = 5, iopsw=10, waitw=8, mibw=10;
+                    int pidw = 10, cpuw = 8, sysw=8, memw = 10, userw = 10, uptimew=10, statew = 5, iopsw=10, waitw=8, mibw=10;
                     
                     // Headers
-                    int fixed_width = pidw + 1 + cpuw + 1 + 
+                    int fixed_width = pidw + 1 + cpuw + 1 + sysw + 1 +
                                       memw + 1 + memw + 1 + memw + 1 + 
                                       uptimew + 1 + userw + 1 + 
                                       iopsw + 1 + iopsw + 1 + 
@@ -1197,10 +1203,10 @@ int main(int argc, char **argv) {
                                       mibw + 1 + mibw + 1 + 
                                       statew + 1;
                                       
-                    int cmdw = cols - fixed_width; 
+                    int cmdw = cols - fixed_width;
                     if (cmdw < 10) cmdw = 10;
 
-                    printf("%*s %-*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s %s\n",
+                    printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*s %*c %s\n",
                         pidw, "[1] PID",
                         userw, "User",
                         uptimew, "Uptime",
@@ -1209,23 +1215,25 @@ int main(int argc, char **argv) {
                         memw, "Virt(MiB)",
                         iopsw, "[3] R_Log",
                         iopsw, "[4] W_Log",
-                        waitw, "[5] Wait",
-                        mibw, "[6] R_MiB",
-                        mibw, "[7] W_MiB",
-                        cpuw, "[2] CPU%",
-                        statew, "[8] S",
-                        "COMMAND"
+                        waitw, 2, "Wait",
+                        mibw, 2, "R_MiB",
+                        mibw, 2, "W_MiB",
+                        cpuw, 2, "CPU%",
+                        sysw, "Sys%",
+                        statew, 'S',
+                        "COMMAND LINE"
                     );
                     
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
 
                     // Calc totals
-                    double t_cpu=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
+                    double t_cpu=0, t_sys=0, t_ri=0, t_wi=0, t_rm=0, t_wm=0, t_wt=0;
                     double t_res=0, t_shr=0, t_virt=0;
                     
                     for(size_t i=0; i<curr_raw.len; i++) {
                         t_cpu += curr_raw.data[i].cpu_pct;
+                        t_sys += curr_raw.data[i].sys_cpu_pct;
                         t_ri  += curr_raw.data[i].r_iops;
                         t_wi  += curr_raw.data[i].w_iops;
                         t_rm  += curr_raw.data[i].r_mib;
@@ -1266,7 +1274,7 @@ int main(int argc, char **argv) {
                         if (days > 0) snprintf(uptime_buf, 32, "%dd%02dh", days, hrs);
                         else snprintf(uptime_buf, 32, "%02d:%02d:%02d", hrs, mins, secs);
 
-                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*c ",
+                        printf("%*s %-*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*.*f %*c ",
                             pidw, pidbuf,
                             userw, c->user,
                             uptimew, uptime_buf,
@@ -1279,18 +1287,19 @@ int main(int argc, char **argv) {
                             mibw, 2, c->r_mib,
                             mibw, 2, c->w_mib,
                             cpuw, 2, c->cpu_pct,
+                            sysw, 2, c->sys_cpu_pct,
                             statew, c->state);
                         fprint_trunc(stdout, c->cmd, cmdw);
                         putchar('\n');
 
                         if (show_tree) {
-                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, iopsw, waitw, mibw, statew, cmdw);
+                            print_threads_for_tgid(&curr_raw, c->tgid, pidw, cpuw, sysw, iopsw, waitw, mibw, statew, cmdw);
                         }
                     }
 
                     for(int i=0; i<cols; i++) putchar('-');
                     putchar('\n');
-                    printf("%*s %*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f\n",
+                    printf("%*s %*s %*s %*.0f %*.0f %*.0f %*.0f %*.0f %*.*f %*.*f %*.*f %*.*f %*.*f\n",
                             pidw, "TOTAL",
                             userw, "",
                             uptimew, "",
@@ -1302,7 +1311,8 @@ int main(int argc, char **argv) {
                             waitw, 2, t_wt,
                             mibw, 0, t_rm,
                             mibw, 0, t_wm,
-                            cpuw, 2, t_cpu);
+                            cpuw, 2, t_cpu,
+                            sysw, 2, t_sys);
                 }
                 fflush(stdout);
                 dirty = 0;
@@ -1314,7 +1324,7 @@ int main(int argc, char **argv) {
 
             int c = wait_for_input(remain);
             // Prevent busy loop if select returns 0 immediately but remain is still large
-            if (c == 0 && remain > 0.1) {
+            if (c == 0 && remain > 0.1) { 
                 usleep(50000); // 50ms sleep to be safe
             }
 
