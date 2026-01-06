@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [ "main" ]
+    branches: [ "main", "dev" ]
   pull_request:
-    branches: [ "main" ]
+    branches: [ "main", "dev" ]
 
 permissions:
   contents: write
@@ -65,11 +65,11 @@ jobs:
         # Get list of releases sorted by date (newest first), exclude 'latest'
         releases=$(gh release list --exclude-drafts --exclude-pre-releases --limit 100 | grep -v "latest" | awk '{print $3}')
         
-        # Keep top 2
+        # Keep only the most recent one (the one just created)
         count=0
         for tag in $releases; do
           count=$((count+1))
-          if [ "$count" -gt 2 ]; then
+          if [ "$count" -gt 1 ]; then
             echo "Deleting old release: $tag"
             gh release delete "$tag" --cleanup-tag -y || true
           fi
