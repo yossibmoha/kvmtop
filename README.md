@@ -10,17 +10,18 @@ It bridges the visibility gap by automatically correlating low-level system proc
 
 ```bash
 # Download the latest static binary
-curl -L -o kvmtop https://github.com/yohaya/kvmtop/releases/download/latest/kvmtop-static-linux-amd64
-chmod +x kvmtop
+wget https://github.com/yossibmoha/kvmtop/releases/download/v1.0.2/kvmtop-linux-amd64-static
+chmod +x kvmtop-linux-amd64-static
+sudo mv kvmtop-linux-amd64-static /usr/local/bin/kvmtop
 
 # Run (sudo recommended for full I/O statistics)
-sudo ./kvmtop
+sudo kvmtop
 ```
 
 **Or build from source:**
 
 ```bash
-git clone https://github.com/yohaya/kvmtop.git
+git clone https://github.com/yossibmoha/kvmtop.git
 cd kvmtop
 make
 sudo ./build/kvmtop
@@ -124,7 +125,7 @@ Contributions are welcome! See the [Development Guide](docs/development.md) for:
 - Testing procedures
 - Submitting pull requests
 
-For bugs or feature requests, visit [GitHub Issues](https://github.com/yohaya/kvmtop/issues).
+For bugs or feature requests, visit [GitHub Issues](https://github.com/yossibmoha/kvmtop/issues).
 
 ## 📜 License
 
@@ -134,7 +135,7 @@ kvmtop is licensed under the **GNU General Public License v3.0**. See [LICENSE](
 
 If you find kvmtop useful, please:
 
-- ⭐ Star this project on [GitHub](https://github.com/yohaya/kvmtop)
+- ⭐ Star this project on [GitHub](https://github.com/yossibmoha/kvmtop)
 - 🐛 Report issues or suggest features
 - 📖 Improve documentation
 - 💻 Contribute code
